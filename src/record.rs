@@ -18,8 +18,8 @@ pub(crate) struct FlagMeta {
     pub(crate) desc: String,
     pub(crate) created: Timestamp,
     /// The flags the session showed when this one was added, plus one. Two
-    /// additions that race can share it; a report orders by `created` first and
-    /// the object name last.
+    /// additions that race can share it; a report orders by `created` and then
+    /// by this.
     pub(crate) counter: u64,
 }
 

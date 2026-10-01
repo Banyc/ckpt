@@ -2461,11 +2461,34 @@ fn a_lookup_reports_a_foreign_name_in_the_shard_it_walks() {
 #[cfg(target_os = "macos")]
 fn a_shard_whose_name_the_filesystem_spells_differently_is_reported() {
     let (dir, store) = book();
-    let session = store.session_new("session").expect("session");
-    let shard = session_dir(dir.path(), &session)
+    // The shard name has to hold a letter for a case change to be a change; the
+    // ids are drawn at random, so one is drawn until it does.
+    let mut session = store.session_new("session").expect("session");
+    let mut shard = session_dir(dir.path(), &session)
         .parent()
         .expect("shard")
         .to_path_buf();
+    for _ in 0..64 {
+        if shard.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .chars()
+                .any(|c| c.is_ascii_alphabetic())
+        }) {
+            break;
+        }
+        session = store.session_new("session").expect("session");
+        shard = session_dir(dir.path(), &session)
+            .parent()
+            .expect("shard")
+            .to_path_buf();
+    }
+    assert!(
+        shard.file_name().is_some_and(|name| name
+            .to_string_lossy()
+            .chars()
+            .any(|c| c.is_ascii_alphabetic())),
+        "a shard with a letter in it was created"
+    );
     let upper = shard.with_file_name(
         shard
             .file_name()
@@ -2480,6 +2503,21 @@ fn a_shard_whose_name_the_filesystem_spells_differently_is_reported() {
     assert!(
         matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
         "a shard name that is not the one on disk is reported"
+    );
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_file_at_a_shard_name_is_reported_by_a_lookup_elsewhere() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    // A file where a shard belongs, in a shard this session is not in.
+    fs::write(dir.path().join("sessions").join("00"), "not a shard")
+        .expect("put a file at a shard name");
+
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "the level a lookup walks holds only shards"
     );
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }

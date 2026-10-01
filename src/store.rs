@@ -519,6 +519,7 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
         if let Some(level) = shard.parent() {
             for (name, path) in sparse::entries(level, sparse::Missing::Empty)? {
                 sparse::require_shard(&name, &path)?;
+                sparse::require_directory(&path)?;
             }
         }
         let name = shard

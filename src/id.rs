@@ -38,8 +38,8 @@ impl Id {
 
     /// Parse a 40-character lowercase hex object name.
     ///
-    /// This is the flat form only: the sparse `ab/rest` form is a layout, so
-    /// [`crate::sparse::parse_id`] reads it and the typed ids accept both.
+    /// This is the flat form only: the sparse `ab/rest` form is a layout, so the
+    /// layout module reads that spelling and the typed ids accept both.
     pub fn parse(input: &str) -> Result<Id, Error> {
         if input.len() != HEX_LEN || !input.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(Error::InvalidId {
