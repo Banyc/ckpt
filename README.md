@@ -54,7 +54,10 @@ one complete line in a single append, so concurrent verifications both land.
 on the total. If that read-back fails, `verify` says so on standard error, prints
 the count the append recorded instead, and exits `3` — the hit was recorded, so
 the command did not fail, but a caller can tell that the book could not be read
-back. Exit `1` means nothing was recorded.
+back. Exit `1` means no record was left complete: a refused or failed creation
+can leave an inert remnant — a mapping entry, a directory, a log whose record
+never landed — which every read treats as absent, the same way a crash mid-write
+does.
 
 ## Commands
 

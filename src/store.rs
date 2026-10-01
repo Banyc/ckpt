@@ -19,7 +19,9 @@
 //!
 //! A directory at an object name with no regular `meta.json` is an interrupted
 //! write rather than a record, and is treated as absent: a partial write must
-//! not poison a record book that has no cleanup command.
+//! not poison a record book that has no cleanup command. An addition that fails
+//! part way can leave such a remnant behind, and the hit log is put back when a
+//! short append can be undone safely.
 //!
 //! `<root>/by-flag/<a>/<b>` holds the one mapping the book keeps: which session
 //! a ctf flag belongs to. It is a mapping and nothing else — one session id —
@@ -570,16 +572,34 @@ fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
         .append(true)
         .open(path)
         .map_err(|err| Error::io(path, err))?;
+    let before = file.metadata().map_err(|err| Error::io(path, err))?.len();
     let written = file
         .write(line.as_bytes())
         .map_err(|err| Error::io(path, err))?;
-    if written != line.len() {
+    if written == line.len() {
+        return Ok(());
+    }
+
+    // A short write left a partial line, which no reader will accept. When
+    // nothing landed after it the log is put back exactly as it was, so a failed
+    // append leaves the record readable; when something did land after it the
+    // partial line is reported instead, because shortening the log would remove
+    // another writer's record.
+    let length = file.metadata().map_err(|err| Error::io(path, err))?.len();
+    if length == before + written as u64 {
+        file.set_len(before).map_err(|err| Error::io(path, err))?;
         return Err(Error::io(
             path,
-            io::Error::new(io::ErrorKind::WriteZero, "short append to the hit log"),
+            io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short append; the log was left as it was",
+            ),
         ));
     }
-    Ok(())
+    Err(Error::io(
+        path,
+        io::Error::new(io::ErrorKind::WriteZero, "short append left a partial line"),
+    ))
 }
 
 #[cfg(test)]

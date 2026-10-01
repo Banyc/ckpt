@@ -368,3 +368,44 @@ fn concurrent_flag_additions_all_land() {
         "a counter is a count the session held"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_short_append_leaves_the_log_as_it_was() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+    let flag = ok(root, &["flag", "new", &session, "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+    let log = root
+        .join("sessions")
+        .join(&session[..2])
+        .join(&session[2..])
+        .join("flags")
+        .join(&flag[..2])
+        .join(&flag[2..])
+        .join("hits.log");
+
+    // A file-size limit makes the append write only part of its line.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -f 1; exec \"$CKPT\" --root \"$ROOT\" verify \"$FLAG\" --note \"$NOTE\"")
+        .env("CKPT", env!("CARGO_BIN_EXE_ckpt"))
+        .env("ROOT", root)
+        .env("FLAG", &flag)
+        .env("NOTE", "x".repeat(2_000))
+        .output()
+        .expect("run ckpt under a file-size limit");
+
+    assert!(!out.status.success(), "the append could not complete");
+    assert_eq!(
+        fs::read_to_string(&log).expect("read the log"),
+        "",
+        "the log was left as it was, so the record still reads"
+    );
+    assert!(
+        ok(root, &["status", &flag]).contains("hits    0"),
+        "and the flag still reports its count"
+    );
+}

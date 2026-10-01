@@ -2121,3 +2121,38 @@ fn a_rejected_addition_leaves_no_directory_behind() {
         "and nothing outside the store"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_failed_addition_leaves_only_an_inert_remnant() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flags = session_dir(dir.path(), &session).join("flags");
+    fs::set_permissions(&flags, fs::Permissions::from_mode(0o500)).expect("make flags read-only");
+
+    let added = store.flag_new(&session, "flag");
+    fs::set_permissions(&flags, fs::Permissions::from_mode(0o700)).expect("restore");
+
+    if added.is_ok() {
+        // A user that ignores the file mode (root) cannot fail this way.
+        assert_eq!(
+            store.status(session.as_id()).expect("status").flags.len(),
+            1
+        );
+        return;
+    }
+    assert!(
+        store.sessions().is_ok(),
+        "whatever the failed addition left is not reported as damage"
+    );
+    assert!(
+        store
+            .status(session.as_id())
+            .expect("status")
+            .flags
+            .is_empty(),
+        "and no flag is listed"
+    );
+}
