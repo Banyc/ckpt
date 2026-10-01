@@ -198,7 +198,7 @@ fn unknown_ids_are_not_found() {
     let (_dir, store) = book();
     assert!(store.sessions().expect("sessions").is_empty());
 
-    let absent_session = SessionId::generate();
+    let absent_session = SessionId::generate().expect("id");
     assert!(matches!(
         store.status(absent_session.as_id()),
         Err(Error::NotFound { .. })
@@ -208,7 +208,7 @@ fn unknown_ids_are_not_found() {
         Err(Error::NotFound { .. })
     ));
 
-    let absent_flag = FlagId::generate();
+    let absent_flag = FlagId::generate().expect("id");
     assert!(matches!(
         store.verify(&absent_flag, &Verify::new()),
         Err(Error::NotFound { .. })
@@ -2069,7 +2069,7 @@ fn a_foreign_session_directory_is_reported_even_with_no_shard_below_it() {
     let outside = TempDir::new().expect("temp dir");
     std::os::unix::fs::symlink(outside.path(), dir.path().join("sessions")).expect("symlink");
 
-    let absent = SessionId::generate();
+    let absent = SessionId::generate().expect("id");
     assert!(
         matches!(store.status(absent.as_id()), Err(Error::Corrupt { .. })),
         "the link is reported, not hidden behind the missing shard"
@@ -2449,7 +2449,7 @@ fn a_lookup_reports_a_foreign_name_in_the_shard_it_walks() {
             "the lookup reports the shard it walked"
         );
     }
-    let elsewhere = SessionId::generate();
+    let elsewhere = SessionId::generate().expect("id");
     assert!(matches!(
         store.status(elsewhere.as_id()),
         Err(Error::NotFound { .. })
@@ -2520,4 +2520,82 @@ fn a_file_at_a_shard_name_is_reported_by_a_lookup_elsewhere() {
         "the level a lookup walks holds only shards"
     );
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_mapping_entry_without_its_newline_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    // Exactly what a write cut short after the id would leave.
+    fs::write(
+        dir.path().join("by-flag").join(flag.sparse_path()),
+        format!("{session}"),
+    )
+    .expect("write the mapping without its newline");
+
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn an_addition_reports_a_sibling_whose_meta_is_not_a_file() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let sibling = store.flag_new(&session, "sibling").expect("flag");
+    let meta = flag_dir(dir.path(), &session, &sibling).join("meta.json");
+    fs::remove_file(&meta).expect("remove the sibling's meta");
+    fs::create_dir(&meta).expect("put a directory at the sibling's meta.json");
+
+    assert!(
+        matches!(store.flag_new(&session, "flag"), Err(Error::Corrupt { .. })),
+        "an addition walks the session's flags, and reports what it walks"
+    );
+}
+
+#[test]
+fn adding_flags_while_verifying_does_not_disturb_either() {
+    let (_, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    let added = 20;
+    let verified = 50;
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for _ in 0..added {
+                store
+                    .flag_new(&session, "added")
+                    .expect("a flag is added while reads happen");
+            }
+        });
+        scope.spawn(|| {
+            for _ in 0..verified {
+                store
+                    .verify(&flag, &Verify::new())
+                    .expect("a hit lands while flags are added");
+                store
+                    .sessions()
+                    .expect("the book reads while flags are added");
+            }
+        });
+    });
+
+    let status = store.status(session.as_id()).expect("status");
+    assert_eq!(status.flags.len(), added + 1);
+    assert_eq!(
+        status
+            .flags
+            .iter()
+            .find(|entry| entry.id == flag)
+            .expect("the flag")
+            .hits,
+        verified
+    );
 }

@@ -25,15 +25,15 @@ pub struct Id(String);
 
 impl Id {
     /// Draw a fresh id from the operating system.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the operating system cannot supply randomness, in which case
-    /// no id in this process could be distinct from any other.
-    pub fn generate() -> Id {
+    pub fn generate() -> Result<Id, Error> {
         let mut bytes = [0u8; ID_BYTES];
-        getrandom::fill(&mut bytes).expect("operating system randomness is available");
-        Id(hex(&bytes))
+        getrandom::fill(&mut bytes).map_err(|err| {
+            Error::io(
+                "operating system randomness",
+                std::io::Error::other(err.to_string()),
+            )
+        })?;
+        Ok(Id(hex(&bytes)))
     }
 
     /// Parse a 40-character lowercase hex object name.
@@ -93,8 +93,8 @@ macro_rules! object_id {
 
         impl $name {
             /// Draw a fresh id from the operating system.
-            pub fn generate() -> $name {
-                $name(Id::generate())
+            pub fn generate() -> Result<$name, Error> {
+                Ok($name(Id::generate()?))
             }
 
             /// Parse a written object name, flat or in sparse `ab/rest` form.

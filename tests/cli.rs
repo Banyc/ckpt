@@ -530,3 +530,44 @@ fn the_matched_flag_is_marked_in_a_report() {
         "and nothing is marked when the session was asked for: {by_session}"
     );
 }
+
+#[test]
+fn a_damaged_tree_exits_one() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+    let first = ok(root, &["flag", "new", &session, "--desc", "first"]);
+    let first = first.trim().to_owned();
+    let second = ok(root, &["flag", "new", &session, "--desc", "second"]);
+    let second = second.trim().to_owned();
+    fs::write(
+        root.join("sessions")
+            .join(&session[..2])
+            .join(&session[2..])
+            .join("flags")
+            .join(&second[..2])
+            .join(&second[2..])
+            .join("hits.log"),
+        "not json\n",
+    )
+    .expect("damage a sibling's log");
+
+    let out = ckpt(root, &["status", &first]);
+    assert_eq!(out.status.code(), Some(1), "a damaged book is a failure");
+    assert!(!out.stderr.is_empty(), "and it says why");
+}
+
+#[test]
+fn a_root_that_is_a_file_exits_one() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("not-a-directory");
+    fs::write(&file, "x").expect("write a file");
+
+    let out = ckpt(&file, &["session", "new", "--desc", "s"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("not-a-directory"),
+        "and it names what it could not use"
+    );
+}

@@ -57,9 +57,10 @@ both land.
 on the total. If that read-back fails, `verify` says so on standard error, prints
 the count the append recorded instead, and exits `3` — the hit was recorded, so
 the command did not fail, but a caller can tell that the book could not be read
-back. Exit `3` means the command did its work but could not report it: a hit was
-recorded and its count could not be read back or written, or a record was created
-and its id could not be written. Exit `1` means no record was left complete: a
+back. Exit `3` means the command did its work but could not report it: a report
+that could not be written, a hit whose count could not be read back, a created
+record whose id could not be written. Exit `2` is a usage error, from the argument
+parser. Exit `1` means no record was left complete: a
 refused or failed creation takes its mapping entry back. What a failure or a crash
 can still leave is a directory with no record in it, which reads treat as absent,
 a record a partial write cut short, which reads report as damaged, or a mapping

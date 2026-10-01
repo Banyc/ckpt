@@ -110,7 +110,7 @@ impl Store {
     /// every directory below it is created one level at a time so a link
     /// planted above a record is reported instead of followed.
     pub fn session_new(&self, desc: &str) -> Result<SessionId, Error> {
-        let session = SessionId::generate();
+        let session = SessionId::generate()?;
         fs::create_dir_all(&self.root).map_err(|err| Error::io(&self.root, err))?;
         sparse::ensure_directory(&self.sessions_dir())?;
         sparse::ensure_directory(&self.session_shard_dir(&session))?;
@@ -144,7 +144,7 @@ impl Store {
         // what validates every shard and the mapping.
         let counter = self.flag_ids(session)?.len() as u64 + 1;
 
-        let flag = FlagId::generate();
+        let flag = FlagId::generate()?;
         // The mapping is written first, so a refusal there leaves nothing of the
         // flag behind: what can be refused is refused before anything is made.
         self.write_owner(session, &flag)?;
@@ -205,9 +205,9 @@ impl Store {
     /// Append one verification hit for `flag` and report its count.
     ///
     /// The count is the number of hits the log held when this append was
-    /// prepared, plus this one. A concurrent append can land first, so the
-    /// number is a lower bound on the log's total; [`Store::status`] is the
-    /// authority on the total.
+    /// prepared, plus this one, and the instant is this hit's. A concurrent
+    /// append can land first, so both are as of this append rather than of the
+    /// log's last line; [`Store::status`] is the authority on the total.
     ///
     /// An `Ok` result means one complete hit line was appended. An error means
     /// no complete hit was appended: a damaged or foreign record is rejected
@@ -392,9 +392,14 @@ impl Store {
             return Ok(None);
         };
         // The writer ends the entry with a newline and writes nothing else, so
-        // nothing else is accepted: the mapping holds one id, not a field to
-        // search through.
-        let id = text.strip_suffix('\n').unwrap_or(&text);
+        // nothing else is accepted: an entry a short write left without its
+        // newline is damage, not an id to read past.
+        let Some(id) = text.strip_suffix('\n') else {
+            return Err(Error::Corrupt {
+                path,
+                detail: "an index entry ends with a newline".to_owned(),
+            });
+        };
         SessionId::parse(id).map(Some).map_err(|_| Error::Corrupt {
             path,
             detail: "an index entry must be a session id and nothing else".to_owned(),
