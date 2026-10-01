@@ -445,7 +445,7 @@ fn a_short_append_keeps_the_hits_before_it() {
         .env("NOTE", "x".repeat(2_000))
         .output()
         .expect("run ckpt under a file-size limit");
-    assert!(!out.status.success(), "the append could not complete");
+    assert_eq!(out.status.code(), Some(1), "nothing was appended");
 
     assert_eq!(
         fs::read_to_string(&log).expect("read the log"),
@@ -484,7 +484,7 @@ fn a_short_append_leaves_the_log_as_it_was() {
         .output()
         .expect("run ckpt under a file-size limit");
 
-    assert!(!out.status.success(), "the append could not complete");
+    assert_eq!(out.status.code(), Some(1), "nothing was appended");
     assert_eq!(
         fs::read_to_string(&log).expect("read the log"),
         "",

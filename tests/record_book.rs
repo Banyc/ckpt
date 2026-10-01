@@ -1184,10 +1184,20 @@ fn flags_are_ordered_by_instant_then_counter() {
     let third = store.flag_new(&session, "third").expect("flag");
 
     let status = store.status(session.as_id()).expect("status");
-    let order: Vec<&FlagId> = status.flags.iter().map(|flag| &flag.id).collect();
-    assert_eq!(order, vec![&first, &second, &third], "creation order");
-    let counters: Vec<u64> = status.flags.iter().map(|flag| flag.counter).collect();
-    assert_eq!(counters, vec![1, 2, 3]);
+    let mut counters: Vec<u64> = status.flags.iter().map(|flag| flag.counter).collect();
+    counters.sort_unstable();
+    assert_eq!(counters, vec![1, 2, 3], "each flag takes the next counter");
+    // The report is ordered by its own keys, which holds whatever the wall clock
+    // did between the additions.
+    let keys: Vec<(Timestamp, u64)> = status
+        .flags
+        .iter()
+        .map(|flag| (flag.created, flag.counter))
+        .collect();
+    assert!(
+        keys.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the report is ordered by instant, then counter"
+    );
 
     // Hand-set instants: the later instant comes last whatever the counter says,
     // and flags sharing an instant are ordered by the counter.
@@ -2280,6 +2290,7 @@ fn a_padded_hit_line_is_reported() {
         "{\"ts\":\"2030-01-01T00:00:00Z\"}\r\n",
         "  {\"ts\":\"2030-01-01T00:00:00Z\"}\n",
         "{\"ts\":\"2030-01-01T00:00:00Z\"} \n",
+        "{\"ts\"\r:\"2030-01-01T00:00:00Z\"}\n",
     ] {
         fs::write(&log, line).expect("write a padded line");
         assert!(
@@ -2346,4 +2357,21 @@ fn a_flag_counter_of_zero_is_reported() {
         matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
         "the counter counts the flags the session showed, so it starts at one"
     );
+}
+
+#[test]
+fn a_file_at_a_canonical_name_beside_a_record_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let shard = session_dir(dir.path(), &session)
+        .parent()
+        .expect("shard")
+        .to_path_buf();
+    fs::write(shard.join("9".repeat(38)), "not a record").expect("write a file beside the session");
+
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "a record is not read past a canonical name that is not a record"
+    );
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }

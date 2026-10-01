@@ -12,7 +12,7 @@
 //! it claims to be.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -296,9 +296,20 @@ pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "record".to_owned());
     let temp = path.with_file_name(format!("{name}.{}.tmp", &Id::generate().as_str()[..8]));
-    if let Err(err) = fs::write(&temp, contents) {
+    // Created exclusively: a name that is already there — including a link
+    // planted at it — is refused by the kernel rather than written through.
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+    {
+        Ok(file) => file,
+        Err(err) => return Err(left_behind(&temp, err)),
+    };
+    if let Err(err) = file.write_all(contents.as_bytes()) {
         return Err(left_behind(&temp, err));
     }
+    drop(file);
     fs::rename(&temp, path).map_err(|err| left_behind(&temp, err))
 }
 
