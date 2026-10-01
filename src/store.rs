@@ -589,20 +589,32 @@ fn write_record<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
 fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
     sparse::require_regular_file(path)?;
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
-    if !text.is_empty() && !text.ends_with('\n') {
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let Some(body) = text.strip_suffix('\n') else {
         return Err(Error::Corrupt {
             path: path.to_path_buf(),
             detail: "the final line has no terminating newline".to_owned(),
         });
-    }
-    text.lines()
-        .map(|line| {
-            serde_json::from_str(line).map_err(|err| Error::Corrupt {
+    };
+    // The lines are split here rather than by `str::lines`, which hides a
+    // carriage return: the writer appends one JSON object and a newline, and
+    // anything else on the line is damage rather than something to parse past.
+    let mut hits = Vec::new();
+    for line in body.split('\n') {
+        if line.trim() != line || line.contains('\r') {
+            return Err(Error::Corrupt {
                 path: path.to_path_buf(),
-                detail: err.to_string(),
-            })
-        })
-        .collect()
+                detail: "a hit line must be one JSON object and nothing else".to_owned(),
+            });
+        }
+        hits.push(serde_json::from_str(line).map_err(|err| Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: err.to_string(),
+        })?);
+    }
+    Ok(hits)
 }
 
 /// Append one hit as a single complete line.

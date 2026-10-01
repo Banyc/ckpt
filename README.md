@@ -47,9 +47,10 @@ followed.
 Looking a flag up reads its mapping entry and then the flags of the session the
 mapping names, so it costs a file read and the owner's own flags instead of a
 walk over every session. The mapping is read by key rather than enumerated, so a
-name in `by-flag/` that nothing looks up is never read; an entry that is a
-directory, a link, or not a session id is reported when it is looked up. Reads always come from disk; nothing is cached, so a
-hit appended by another process is visible on the next read. A hit is written as
+name in `by-flag/` that nothing looks up is never read: an entry that is a
+directory, a link, or not a session id is reported when it is looked up, and an
+entry nothing looks up is not read at all. Reads always come from disk; nothing
+is cached, so a hit appended by another process is visible on the next read. A hit is written as
 one complete line in a single append, so concurrent verifications both land.
 `verify` prints the log's count when it reads back, and `status` is the authority
 on the total. If that read-back fails, `verify` says so on standard error, prints
@@ -61,7 +62,8 @@ and its id could not be written. Exit `1` means no record was left complete: a
 refused or failed creation takes its mapping entry back, and what a failure or a
 crash can still leave is a directory with no record in it, which reads treat as
 absent, or a mapping entry whose flag never landed, which is reported when that
-id is looked up.
+id is looked up. A take-back that itself fails says so on standard error, and the
+entry it could not remove is reported the same way.
 
 ## Commands
 

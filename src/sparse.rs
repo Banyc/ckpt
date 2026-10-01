@@ -264,7 +264,10 @@ pub(crate) fn read_owned_file(path: &Path) -> Result<Option<String>, Error> {
 /// Write a file the store owns, which must not already be there.
 ///
 /// A file is written once: a name that already holds one is reported rather than
-/// overwritten, so a collision cannot destroy what landed there first.
+/// overwritten, so a collision cannot destroy what landed there first. The
+/// content goes to a name beside it and is moved into place, so a write that
+/// fails part way leaves no record at all — a truncated record is worse than an
+/// absent one in a book that has no cleanup command.
 pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => {
@@ -285,7 +288,22 @@ pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => return Err(Error::io(path, err)),
     }
-    fs::write(path, contents).map_err(|err| Error::io(path, err))
+
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "record".to_owned());
+    let temp = path.with_file_name(format!("{name}.{}.tmp", &Id::generate().as_str()[..8]));
+    if let Err(err) = fs::write(&temp, contents) {
+        // A name nothing reads is what a failed write is allowed to leave; the
+        // failure to remove it is not worth a second error.
+        let _ = fs::remove_file(&temp);
+        return Err(Error::io(&temp, err));
+    }
+    fs::rename(&temp, path).map_err(|err| {
+        let _ = fs::remove_file(&temp);
+        Error::io(path, err)
+    })
 }
 
 #[cfg(test)]

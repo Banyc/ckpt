@@ -103,6 +103,13 @@ fn report_done(line: &str, what: &str) -> ExitCode {
     }
 }
 
+/// The code for a command whose report could not be written, whatever the
+/// command had done by then.
+fn report_failed(what: &str, err: &Error) -> ExitCode {
+    eprintln!("ckpt: {what}, but reporting it failed: {err}");
+    ExitCode::from(REPORT_FAILED)
+}
+
 fn main() -> ExitCode {
     let Cli { root, command } = Cli::parse();
     let store = root.map_or_else(Store::from_env, Store::at);
@@ -127,17 +134,20 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
             }
             SessionCommand::List { json } => {
                 let sessions = store.sessions()?;
-                if json {
-                    print_json(&sessions)?;
+                let printed = if json {
+                    print_json(&sessions)
                 } else if sessions.is_empty() {
-                    report(&format!("no sessions in {}", store.root().display()))?;
+                    report(&format!("no sessions in {}", store.root().display()))
                 } else {
-                    for session in &sessions {
+                    sessions.iter().try_for_each(|session| {
                         report(&format!(
                             "{}  flags {}  hits {}  {}",
                             session.session, session.flags, session.hits, session.desc
-                        ))?;
-                    }
+                        ))
+                    })
+                };
+                if let Err(err) = printed {
+                    return Ok(report_failed("the book was read", &err));
                 }
             }
         },
@@ -173,10 +183,13 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
             // book decides.
             let id = SessionId::parse(&id)?;
             let status = store.status(id.as_id())?;
-            if json {
-                print_json(&status)?;
+            let printed = if json {
+                print_json(&status)
             } else {
-                print_status(&status)?;
+                print_status(&status)
+            };
+            if let Err(err) = printed {
+                return Ok(report_failed("the book was read", &err));
             }
         }
     }

@@ -2252,3 +2252,46 @@ fn a_mapping_entry_may_be_written_in_sparse_form() {
         "a sparse session id is read the way a flat one is"
     );
 }
+
+#[test]
+fn a_padded_hit_line_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+
+    for line in [
+        "{\"ts\":\"2030-01-01T00:00:00Z\"}\r\n",
+        "  {\"ts\":\"2030-01-01T00:00:00Z\"}\n",
+        "{\"ts\":\"2030-01-01T00:00:00Z\"} \n",
+    ] {
+        fs::write(&log, line).expect("write a padded line");
+        assert!(
+            matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+            "the writer emits one JSON object and a newline, so {line:?} is damage"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlink_at_a_mapping_entry_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let entry = dir.path().join("by-flag").join(flag.sparse_path());
+    let outside = TempDir::new().expect("temp dir");
+    let target = outside.path().join("entry");
+    fs::write(&target, format!("{session}\n")).expect("write the target");
+    fs::remove_file(&entry).expect("remove the mapping");
+    std::os::unix::fs::symlink(&target, &entry).expect("symlink the mapping");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a mapping entry that is a link is refused"
+    );
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+}

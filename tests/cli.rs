@@ -391,6 +391,31 @@ fn concurrent_flag_additions_all_land() {
 
 #[test]
 #[cfg(unix)]
+fn a_write_that_cannot_finish_leaves_no_record() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+
+    // A file-size limit cuts the record short. A truncated record would never
+    // read again, so the record must not be there at all.
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -f 1; exec \"$CKPT\" --root \"$ROOT\" session new --desc \"$DESC\"")
+        .env("CKPT", env!("CARGO_BIN_EXE_ckpt"))
+        .env("ROOT", root)
+        .env("DESC", "d".repeat(3_000))
+        .output()
+        .expect("run ckpt under a file-size limit");
+    assert!(!out.status.success(), "the record could not be written");
+
+    let listed = ok(root, &["session", "list"]);
+    assert!(
+        listed.starts_with("no sessions in "),
+        "and the book still reads: {listed}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
 fn a_short_append_leaves_the_log_as_it_was() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();
@@ -459,7 +484,8 @@ fn a_stdout_that_cannot_be_written_is_not_a_panic() {
         "and it did land"
     );
 
-    // A read-only command has nothing to have done, so it just fails.
+    // A report that cannot be written is the same outcome for a command that
+    // only read the book.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ckpt"))
         .arg("--root")
         .arg(root)
@@ -468,5 +494,21 @@ fn a_stdout_that_cannot_be_written_is_not_a_panic() {
         .spawn()
         .expect("spawn ckpt");
     drop(child.stdout.take());
-    assert_eq!(child.wait().expect("wait").code(), Some(1));
+    assert_eq!(child.wait().expect("wait").code(), Some(3));
+
+    // And for one that created a record whose id could not be delivered.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .arg("--root")
+        .arg(root)
+        .args(["flag", "new", session.trim(), "--desc", "g"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ckpt");
+    drop(child.stdout.take());
+    let code = child.wait().expect("wait").code();
+    assert_eq!(code, Some(3));
+    assert!(
+        ok(root, &["status", session.trim()]).contains("flags   2"),
+        "and the flag it created is there"
+    );
 }
