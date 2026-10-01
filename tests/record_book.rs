@@ -354,17 +354,25 @@ fn concurrent_verifications_all_land_intact() {
 
     let threads = 16;
     let per_thread = 50;
+    let counts = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..threads {
             scope.spawn(|| {
                 for _ in 0..per_thread {
-                    store.verify(&flag, &Verify::new()).expect("verify");
+                    let status = store.verify(&flag, &Verify::new()).expect("verify");
+                    counts.lock().expect("lock").push(status.hits);
                 }
             });
         }
     });
 
     let expected = (threads * per_thread) as u64;
+    let counts = counts.into_inner().expect("lock");
+    assert_eq!(counts.len() as u64, expected);
+    assert!(
+        counts.iter().all(|count| *count >= 1 && *count <= expected),
+        "a reported count is a count the log held"
+    );
     let status = store.status(flag.as_id()).expect("status");
     assert_eq!(status.flags[0].hits, expected);
 
@@ -886,6 +894,16 @@ fn a_non_canonical_rest_is_reported() {
     let shard = dir.path().join("sessions").join("ab");
     fs::create_dir_all(shard.join("AB".repeat(19))).expect("create upper rest");
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+
+    // The same under a session's flags/ entry.
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let shard = session_dir(dir.path(), &session).join("flags").join("ab");
+    fs::create_dir_all(shard.join("0".repeat(37))).expect("create short rest");
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
 }
 
 #[test]
@@ -1155,4 +1173,62 @@ fn a_flag_meta_without_a_counter_is_reported() {
         store.status(flag.as_id()),
         Err(Error::Corrupt { .. })
     ));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_flags_directory_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let outside = TempDir::new().expect("temp dir");
+    let flags = session_dir(dir.path(), &session).join("flags");
+    let moved = outside.path().join("flags");
+    fs::rename(&flags, &moved).expect("move flags out of the tree");
+    std::os::unix::fs::symlink(&moved, &flags).expect("symlink");
+
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(moved.join(flag.sparse_path()).join("hits.log"))
+            .expect("read log")
+            .lines()
+            .count(),
+        1,
+        "the rejected verification appended nothing"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn an_unreadable_hit_log_is_reported() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::set_permissions(&log, fs::Permissions::from_mode(0o000)).expect("make the log unreadable");
+
+    if fs::read_to_string(&log).is_ok() {
+        // A user that ignores the file mode (root) cannot exercise this.
+        return;
+    }
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Io { .. })),
+        "a permission error is surfaced, not read as an empty log"
+    );
 }

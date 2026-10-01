@@ -292,7 +292,16 @@ impl Store {
         Ok(owner)
     }
 
-    fn flag_status(&self, session: &SessionId, flag: &FlagId) -> Result<FlagStatus, Error> {
+    /// One ctf flag's status, looked up by the flag's own id.
+    pub fn flag_status(&self, flag: &FlagId) -> Result<FlagStatus, Error> {
+        let session = self.flag_owner(flag)?.ok_or_else(|| Error::NotFound {
+            kind: "flag",
+            id: flag.to_string(),
+        })?;
+        self.read_flag_status(&session, flag)
+    }
+
+    fn read_flag_status(&self, session: &SessionId, flag: &FlagId) -> Result<FlagStatus, Error> {
         let dir = self.flag_dir(session, flag);
         let meta = read_flag_meta(&dir)?;
         let hits = read_hits(&hits_path(&dir))?;
@@ -308,12 +317,23 @@ impl Store {
 
     /// A session's flags in the order they were added: by timestamp, and by the
     /// counter where two timestamps are equal.
+    ///
+    /// A flag recorded under two sessions is reported rather than counted under
+    /// both, which is what a lookup by flag id already does.
     fn flag_statuses(&self, session: &SessionId) -> Result<Vec<FlagStatus>, Error> {
-        let mut statuses: Vec<FlagStatus> = self
-            .flag_ids(session)?
-            .iter()
-            .map(|flag| self.flag_status(session, flag))
-            .collect::<Result<_, _>>()?;
+        let sessions = self.session_ids()?;
+        let mut statuses = Vec::new();
+        for flag in self.flag_ids(session)? {
+            for other in &sessions {
+                if other != session && holds_record(&self.flag_dir(other, &flag))? {
+                    return Err(Error::Corrupt {
+                        path: self.flag_dir(session, &flag),
+                        detail: format!("`{flag}` is recorded under {session} and {other}"),
+                    });
+                }
+            }
+            statuses.push(self.read_flag_status(session, &flag)?);
+        }
         statuses.sort_by(|left, right| {
             (left.created, left.counter).cmp(&(right.created, right.counter))
         });
@@ -655,6 +675,31 @@ fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_record_directory_is_never_reused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ab").join("rest");
+        fs::create_dir_all(path.parent().expect("parent")).expect("create");
+        create_record_dir(&path).expect("the first record takes the name");
+
+        assert!(
+            matches!(create_record_dir(&path), Err(Error::Io { .. })),
+            "a name that already holds a record is not reused"
+        );
+    }
+
+    #[test]
+    fn a_record_file_is_never_written_through_a_foreign_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.json");
+        fs::create_dir(&path).expect("put a directory where meta.json belongs");
+
+        assert!(matches!(
+            write_record(&path, &1u64),
+            Err(Error::Corrupt { .. })
+        ));
+    }
 
     #[test]
     fn a_shard_is_exactly_two_lowercase_hex_characters() {
