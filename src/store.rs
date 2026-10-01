@@ -21,6 +21,14 @@
 //! write rather than a record, and is treated as absent: a partial write must
 //! not poison a record book that has no cleanup command.
 //!
+//! `<root>/by-flag/<a>/<b>` holds the one mapping the book keeps: which session
+//! a ctf flag belongs to. It is a mapping and nothing else — one session id —
+//! so no record field is stored twice in it. Its entry is written before the
+//! flag's own files, so a flag that can be read is always mapped, and every read
+//! checks the mapping against the tree: a flag the mapping does not give to the
+//! session being reported, or a session the mapping names that does not hold the
+//! flag, is reported rather than followed.
+//!
 //! A record directory is read by name — its `meta.json` and `hits.log` — so
 //! other names inside it are ignored. The checks above are made before a path is
 //! used rather than while it is open: they refuse links and foreign entries left
@@ -129,6 +137,7 @@ impl Store {
         let flag_dir = self.flag_dir(session, &flag);
         sparse::ensure_directory(&self.flag_shard_dir(session, &flag))?;
         sparse::create_record_dir(&flag_dir)?;
+        self.write_owner(session, &flag)?;
         let hits = hits_path(&flag_dir);
         File::create(&hits).map_err(|err| Error::io(&hits, err))?;
         let counter = self.flag_ids(session)?.len() as u64 + 1;
@@ -227,6 +236,18 @@ impl Store {
         self.root.join("sessions")
     }
 
+    fn by_flag_dir(&self) -> PathBuf {
+        self.root.join("by-flag")
+    }
+
+    fn owner_shard_dir(&self, flag: &FlagId) -> PathBuf {
+        self.by_flag_dir().join(sparse::components(flag.as_id()).0)
+    }
+
+    fn owner_path(&self, flag: &FlagId) -> PathBuf {
+        self.by_flag_dir().join(flag.sparse_path())
+    }
+
     fn session_shard_dir(&self, session: &SessionId) -> PathBuf {
         self.sessions_dir()
             .join(sparse::components(session.as_id()).0)
@@ -269,38 +290,62 @@ impl Store {
             sparse::require_shard(&shard, &shard_path)?;
             for (rest, rest_path) in sparse::entries(&shard_path, Missing::Error)? {
                 let flag = FlagId::from_id(sparse::sparse_id(&shard, &rest, &rest_path)?);
-                if holds_record(&rest_path)? {
-                    ids.push(flag);
+                if !holds_record(&rest_path)? {
+                    continue;
                 }
+                // The mapping is the owner record: a flag it does not give to
+                // this session is reported rather than counted here as well.
+                if self.read_owner(&flag)?.as_ref() != Some(session) {
+                    return Err(Error::Corrupt {
+                        path: rest_path,
+                        detail: format!("`{flag}` is not mapped to the session that holds it"),
+                    });
+                }
+                ids.push(flag);
             }
         }
         Ok(ids)
     }
 
+    /// The session the mapping gives this ctf flag to.
+    fn read_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
+        let path = self.owner_path(flag);
+        let Some(text) = sparse::read_owned_file(&path)? else {
+            return Ok(None);
+        };
+        SessionId::parse(text.trim())
+            .map(Some)
+            .map_err(|_| Error::Corrupt {
+                path,
+                detail: "an index entry must be a session id".to_owned(),
+            })
+    }
+
+    /// Map a ctf flag to the session that holds it.
+    ///
+    /// The entry is written before the flag's own files, so a flag that can be
+    /// read is always mapped.
+    fn write_owner(&self, session: &SessionId, flag: &FlagId) -> Result<(), Error> {
+        sparse::ensure_directory(&self.by_flag_dir())?;
+        sparse::ensure_directory(&self.owner_shard_dir(flag))?;
+        sparse::write_new_file(&self.owner_path(flag), &format!("{session}\n"))
+    }
+
     /// The one session a ctf flag is recorded under.
     ///
-    /// A flag is stored inside its session, so this enumerates the flags of
-    /// every session: the tree is the index, and nothing is cached. Enumerating
-    /// them is also what validates each session's shards, so a damaged tree is
-    /// reported here the same way a report reports it, in place of a one-stat
-    /// probe that would answer "no such flag". The same flag id recorded under
-    /// two sessions is reported rather than resolved to one of them, because a
-    /// hit would otherwise land in whichever the walk reached first.
+    /// The mapping says who holds it, and the answer is checked against the
+    /// owner's own tree, which is validated the same way a report validates it,
+    /// so a lookup never calls a damaged tree fine. An entry whose session does
+    /// not hold the flag is a leftover from an interrupted addition, and answers
+    /// "no such flag".
     fn flag_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
-        let mut owner: Option<SessionId> = None;
-        for session in self.session_ids()? {
-            if !self.flag_ids(&session)?.contains(flag) {
-                continue;
-            }
-            if owner.is_some() {
-                return Err(Error::Corrupt {
-                    path: self.flag_dir(&session, flag),
-                    detail: format!("the flag `{flag}` is recorded under two sessions"),
-                });
-            }
-            owner = Some(session);
+        let Some(session) = self.read_owner(flag)? else {
+            return Ok(None);
+        };
+        if !self.flag_ids(&session)?.contains(flag) {
+            return Ok(None);
         }
-        Ok(owner)
+        Ok(Some(session))
     }
 
     /// One ctf flag's status, looked up by the flag's own id.
@@ -326,23 +371,15 @@ impl Store {
         })
     }
 
-    /// A session's flags in the order they were added: by timestamp, and by the
-    /// counter where two timestamps are equal.
+    /// A session's flags in the order they were added: by timestamp, then by the
+    /// counter, then by object name.
     ///
-    /// A flag recorded under two sessions is reported rather than counted under
-    /// both, which is what a lookup by flag id already does.
+    /// A flag the mapping does not give to this session is reported by the walk
+    /// in [`Store::flag_ids`], so a flag held under two sessions is never
+    /// counted under both.
     fn flag_statuses(&self, session: &SessionId) -> Result<Vec<FlagStatus>, Error> {
-        let sessions = self.session_ids()?;
         let mut statuses = Vec::new();
         for flag in self.flag_ids(session)? {
-            for other in &sessions {
-                if other != session && holds_record(&self.flag_dir(other, &flag))? {
-                    return Err(Error::Corrupt {
-                        path: self.flag_dir(session, &flag),
-                        detail: format!("`{flag}` is recorded under {session} and {other}"),
-                    });
-                }
-            }
             statuses.push(self.read_flag_status(session, &flag)?);
         }
         statuses.sort_by(compare_status);
@@ -437,22 +474,11 @@ fn read_record<T: DeserializeOwned>(path: &Path) -> Result<T, Error> {
 }
 
 fn write_record<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => {
-            return Err(Error::Corrupt {
-                path: path.to_path_buf(),
-                detail: "a record file must be a regular file".to_owned(),
-            });
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::io(path, err)),
-    }
     let text = serde_json::to_string(value).map_err(|err| Error::Corrupt {
         path: path.to_path_buf(),
         detail: err.to_string(),
     })?;
-    fs::write(path, format!("{text}\n")).map_err(|err| Error::io(path, err))
+    sparse::write_new_file(path, &format!("{text}\n"))
 }
 
 /// The hits in a log.

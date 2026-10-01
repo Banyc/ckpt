@@ -35,11 +35,20 @@ by object name. Two additions that race each other can take the same counter, so
 the order a report shows is the order the flags were added except where two of
 them landed in the same instant.
 
-Because a flag is stored inside its session, looking a flag up walks the
-`flags/` entry of every session. Reads always come from disk; nothing is cached,
-so a hit appended by another process is visible on the next read. A hit is
-written as one complete line in a single append, so concurrent verifications both
-land. `verify` prints the log's count when it reads back, and `status` is the
+`by-flag/` is the book's one mapping: which session holds a ctf flag. Its entry
+is a session id and nothing else, so no record field is stored twice. It is
+written before the flag's own files, so a flag that can be read is always
+mapped, and every read checks the mapping against the tree: a flag the mapping
+does not give to the session being reported, a mapping whose session does not
+hold the flag, and a mapping that is not a session id are reported rather than
+followed.
+
+Looking a flag up reads its mapping entry and then the flags of the session the
+mapping names, so it costs a file read and the owner's own flags instead of a
+walk over every session. Reads always come from disk; nothing is cached, so a
+hit appended by another process is visible on the next read. A hit is written as
+one complete line in a single append, so concurrent verifications both land.
+`verify` prints the log's count when it reads back, and `status` is the
 authority on the total.
 
 ## Commands

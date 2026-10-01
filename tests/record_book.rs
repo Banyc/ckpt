@@ -553,8 +553,8 @@ fn a_flag_under_a_session_without_meta_is_not_found() {
     fs::remove_file(session_dir(dir.path(), &session).join("meta.json")).expect("remove meta");
 
     assert!(
-        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
-        "a session exists once its meta.json does"
+        matches!(store.status(flag.as_id()), Err(Error::Io { .. })),
+        "a session exists once its meta.json does, so the report cannot be read"
     );
     assert!(matches!(
         store.flag_new(&session, "another"),
@@ -647,7 +647,7 @@ fn a_symlink_at_a_flag_object_name_is_not_written_through() {
 }
 
 #[test]
-fn a_file_at_a_flag_object_name_is_reported_by_the_flag_path() {
+fn a_file_at_a_flag_object_name_is_reported_by_the_session() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
     let stray = session_dir(dir.path(), &session)
@@ -657,18 +657,21 @@ fn a_file_at_a_flag_object_name_is_reported_by_the_flag_path() {
     fs::create_dir_all(stray.parent().expect("parent")).expect("create");
     fs::write(&stray, "not a record").expect("write stray");
 
-    let id = FlagId::parse(&format!("ab{}", "0".repeat(38))).expect("id");
     assert!(
-        matches!(store.status(id.as_id()), Err(Error::Corrupt { .. })),
-        "the flag path reports what the session path reports"
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "the session that holds the foreign entry reports it"
     );
+
+    // The stray name was never mapped, so a lookup by that id finds no flag and
+    // writes nothing into the damaged tree.
+    let id = FlagId::parse(&format!("ab{}", "0".repeat(38))).expect("id");
     assert!(matches!(
-        store.verify(&id, &Verify::new()),
-        Err(Error::Corrupt { .. })
+        store.status(id.as_id()),
+        Err(Error::NotFound { .. })
     ));
     assert!(matches!(
-        store.status(session.as_id()),
-        Err(Error::Corrupt { .. })
+        store.verify(&id, &Verify::new()),
+        Err(Error::NotFound { .. })
     ));
 }
 
@@ -721,7 +724,7 @@ fn a_damaged_log_is_reported_without_appending() {
 }
 
 #[test]
-fn a_flag_recorded_under_two_sessions_is_reported() {
+fn a_flag_copied_to_another_session_is_reported_there() {
     let (dir, store) = book();
     let first = store.session_new("first").expect("session");
     let second = store.session_new("second").expect("session");
@@ -733,24 +736,17 @@ fn a_flag_recorded_under_two_sessions_is_reported() {
     copy_tree(&from, &to);
 
     assert!(
-        matches!(
-            store.verify(&flag, &Verify::new()),
-            Err(Error::Corrupt { .. })
-        ),
-        "a hit must not land in whichever session the walk reached first"
+        store.verify(&flag, &Verify::new()).is_ok(),
+        "the mapping names the owner, so the hit has one place to land"
     );
-    assert!(matches!(
-        store.status(flag.as_id()),
-        Err(Error::Corrupt { .. })
-    ));
     assert!(
-        matches!(store.status(first.as_id()), Err(Error::Corrupt { .. })),
-        "the session's own report would count it under both"
+        store.status(first.as_id()).is_ok(),
+        "the owner holds what the mapping gives it"
     );
-    assert!(matches!(
-        store.status(second.as_id()),
-        Err(Error::Corrupt { .. })
-    ));
+    assert!(
+        matches!(store.status(second.as_id()), Err(Error::Corrupt { .. })),
+        "the session holding a flag the mapping does not give it is reported"
+    );
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }
 
@@ -1324,4 +1320,95 @@ fn a_hard_link_at_a_hit_log_is_reported() {
         "",
         "the other flag's log gained nothing"
     );
+}
+
+#[test]
+fn the_mapping_is_the_session_and_nothing_else() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    let entry = dir.path().join("by-flag").join(flag.sparse_path());
+    assert_eq!(
+        fs::read_to_string(&entry).expect("read the mapping"),
+        format!("{session}\n"),
+        "the mapping is one session id, with no record field stored twice"
+    );
+}
+
+#[test]
+fn a_flag_the_mapping_does_not_name_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::remove_file(dir.path().join("by-flag").join(flag.sparse_path())).expect("remove mapping");
+
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "a report reports the flag it cannot place"
+    );
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
+        "a lookup by flag id has no mapping to follow"
+    );
+}
+
+#[test]
+fn a_mapping_whose_flag_is_gone_answers_not_found() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::remove_dir_all(flag_dir(dir.path(), &session, &flag)).expect("remove the flag");
+
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::NotFound { .. })
+    ));
+    assert!(
+        store
+            .status(session.as_id())
+            .expect("status")
+            .flags
+            .is_empty(),
+        "the session no longer holds it"
+    );
+}
+
+#[test]
+fn a_mapping_that_names_another_session_is_reported() {
+    let (dir, store) = book();
+    let first = store.session_new("first").expect("session");
+    let second = store.session_new("second").expect("session");
+    let flag = store.flag_new(&first, "flag").expect("flag");
+    fs::write(
+        dir.path().join("by-flag").join(flag.sparse_path()),
+        format!("{second}\n"),
+    )
+    .expect("point the mapping at another session");
+
+    assert!(
+        matches!(store.status(first.as_id()), Err(Error::Corrupt { .. })),
+        "the session holding a flag it is not mapped to is reported"
+    );
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
+        "the named session does not hold it"
+    );
+}
+
+#[test]
+fn a_mapping_that_is_not_a_session_id_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        dir.path().join("by-flag").join(flag.sparse_path()),
+        "not an id\n",
+    )
+    .expect("write rubbish where the mapping belongs");
+
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
 }

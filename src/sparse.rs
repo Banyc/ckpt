@@ -238,6 +238,52 @@ pub(crate) fn require_regular_file(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// The text of a file the store owns, with the directories above it checked.
+///
+/// `Ok(None)` means the file is not there.
+pub(crate) fn read_owned_file(path: &Path) -> Result<Option<String>, Error> {
+    if !ancestors_are_real(path)? {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(Error::io(path, err)),
+        Ok(_) => {
+            require_regular_file(path)?;
+            fs::read_to_string(path)
+                .map(Some)
+                .map_err(|err| Error::io(path, err))
+        }
+    }
+}
+
+/// Write a file the store owns, which must not already be there.
+///
+/// A file is written once: a name that already holds one is reported rather than
+/// overwritten, so a collision cannot destroy what landed there first.
+pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::Corrupt {
+                path: path.to_path_buf(),
+                detail: "a store file must be a regular file".to_owned(),
+            });
+        }
+        Ok(_) => {
+            return Err(Error::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "a file already holds this name",
+                ),
+            ));
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::io(path, err)),
+    }
+    fs::write(path, contents).map_err(|err| Error::io(path, err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,5 +349,38 @@ mod tests {
             matches!(create_record_dir(&path), Err(Error::Io { .. })),
             "a name that already holds a record is not reused"
         );
+    }
+
+    #[test]
+    fn a_store_file_is_written_once() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("entry");
+        write_new_file(&path, "first\n").expect("the first write takes the name");
+
+        assert!(
+            matches!(write_new_file(&path, "second\n"), Err(Error::Io { .. })),
+            "a name that already holds a file is not overwritten"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), "first\n");
+    }
+
+    #[test]
+    fn a_store_file_is_not_written_through_a_foreign_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("entry");
+        fs::create_dir(&path).expect("put a directory where the file belongs");
+
+        assert!(matches!(
+            write_new_file(&path, "value\n"),
+            Err(Error::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_store_file_is_not_there() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("entry");
+
+        assert!(matches!(read_owned_file(&path), Ok(None)));
     }
 }
