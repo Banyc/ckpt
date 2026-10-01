@@ -88,6 +88,19 @@ fn json_reports_carry_the_id_they_matched() {
 }
 
 #[test]
+fn status_accepts_the_sparse_id_form() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let flag = ok(root, &["flag", "new", session.trim(), "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+
+    let sparse = format!("{}/{}", &flag[..2], &flag[2..]);
+    let status = ok(root, &["status", &sparse]);
+    assert!(status.contains(&flag), "{status}");
+}
+
+#[test]
 fn a_bad_id_exits_one_with_a_readable_error() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();

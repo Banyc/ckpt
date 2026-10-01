@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use serde::Serialize;
 
-use ckpt::{Error, FlagId, Id, SessionId, Status, Store, Target, Verify};
+use ckpt::{Error, FlagId, SessionId, Status, Store, Target, Verify};
 
 /// Record book for checkpoint flags.
 #[derive(Parser)]
@@ -136,7 +136,10 @@ fn run(store: &Store, command: Command) -> Result<(), Error> {
             println!("flag {} hits={hits}", recorded.id);
         }
         Command::Status { id, json } => {
-            let status = store.status(&Id::parse(&id)?)?;
+            // Either kind of id is written the same way; which kind it is, the
+            // book decides.
+            let id = SessionId::parse(&id)?;
+            let status = store.status(id.as_id())?;
             if json {
                 print_json(&status);
             } else {

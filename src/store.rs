@@ -203,15 +203,14 @@ impl Store {
         let session = SessionId::from_id(id.clone());
         let flag = FlagId::from_id(id.clone());
         let as_session = holds_record(&self.session_dir(&session))?;
+        // A lookup reports an id that is both, so this never resolves one.
         let owner = self.flag_owner(&flag)?;
-        match (as_session, owner) {
-            (true, Some(other)) => Err(Error::Corrupt {
-                path: self.session_dir(&session),
-                detail: format!("`{id}` is both a session and a ctf flag recorded under {other}"),
-            }),
-            (true, None) => self.session_status(&session, Target::Session),
-            (false, Some(owner)) => self.session_status(&owner, Target::Flag { id: flag }),
-            (false, None) => Err(Error::NotFound {
+        if as_session {
+            return self.session_status(&session, Target::Session);
+        }
+        match owner {
+            Some(owner) => self.session_status(&owner, Target::Flag { id: flag }),
+            None => Err(Error::NotFound {
                 kind: "session or flag",
                 id: id.to_string(),
             }),
@@ -279,9 +278,21 @@ impl Store {
             sparse::require_shard(&shard, &shard_path)?;
             for (rest, rest_path) in sparse::entries(&shard_path, Missing::Empty)? {
                 let session = SessionId::from_id(sparse::sparse_id(&shard, &rest, &rest_path)?);
-                if holds_record(&rest_path)? {
-                    ids.push(session);
+                if !holds_record(&rest_path)? {
+                    continue;
                 }
+                // An id that also names a ctf flag is reported rather than listed
+                // as a session as well.
+                if self
+                    .read_owner(&FlagId::from_id(session.as_id().clone()))?
+                    .is_some()
+                {
+                    return Err(Error::Corrupt {
+                        path: rest_path,
+                        detail: format!("`{session}` is both a session and a ctf flag"),
+                    });
+                }
+                ids.push(session);
             }
         }
         Ok(ids)
@@ -345,8 +356,21 @@ impl Store {
         let Some(session) = self.read_owner(flag)? else {
             return Ok(None);
         };
-        // The owner must be a session that reads, so a hit is not written into
-        // a record every report calls corrupt.
+        // An id that is also a session is reported wherever it is looked up, not
+        // only by a report of that session.
+        let as_session = SessionId::from_id(flag.as_id().clone());
+        if holds_record(&self.session_dir(&as_session))? {
+            return Err(Error::Corrupt {
+                path: self.session_dir(&as_session),
+                detail: format!("`{flag}` is both a session and a ctf flag"),
+            });
+        }
+        // The owner must be a record the same checks accept, so its directories
+        // are checked before anything is read through them and a hit is never
+        // written into a record every report calls corrupt.
+        if !holds_record(&self.session_dir(&session))? {
+            return Ok(None);
+        }
         read_session_meta(&self.session_dir(&session))?;
         if !self.flag_ids(&session)?.contains(flag) {
             return Ok(None);

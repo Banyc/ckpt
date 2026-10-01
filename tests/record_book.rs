@@ -554,8 +554,8 @@ fn a_flag_under_a_session_without_meta_is_not_found() {
     fs::remove_file(session_dir(dir.path(), &session).join("meta.json")).expect("remove meta");
 
     assert!(
-        matches!(store.status(flag.as_id()), Err(Error::Io { .. })),
-        "a session exists once its meta.json does, so the report cannot be read"
+        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
+        "a session exists once its meta.json does, so its flags are not reachable"
     );
     assert!(matches!(
         store.flag_new(&session, "another"),
@@ -1286,11 +1286,20 @@ fn an_id_that_is_both_a_session_and_a_flag_is_reported() {
     fs::create_dir_all(to.parent().expect("parent")).expect("create");
     fs::rename(&from, &to).expect("move the impostor session");
 
+    // Every entry point reports the collision rather than resolving one way.
     assert!(
         matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
-        "a flag id resolves to its own session or reports the collision"
+        "a report of the id"
     );
-    assert!(store.verify(&flag, &Verify::new()).is_ok());
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }
 
 #[test]
@@ -1569,4 +1578,159 @@ fn an_external_line_belongs_to_the_flag_that_holds_it() {
         0,
         "the sibling is untouched"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_session_is_not_read_or_written_through() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let outside = TempDir::new().expect("temp dir");
+    let link = session_dir(dir.path(), &session);
+    let moved = outside.path().join("session");
+    fs::rename(&link, &moved).expect("move the session out of the tree");
+    std::os::unix::fs::symlink(&moved, &link).expect("symlink");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a link at a session is refused by a lookup"
+    );
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    let log = moved
+        .join("flags")
+        .join(flag.sparse_path())
+        .join("hits.log");
+    assert_eq!(
+        fs::read_to_string(&log)
+            .expect("read the log")
+            .lines()
+            .count(),
+        1,
+        "no hit was appended outside the store"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_session_shard_is_not_read_or_written_through() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let outside = TempDir::new().expect("temp dir");
+    let session_path = session_dir(dir.path(), &session);
+    let shard = session_path.parent().expect("shard").to_path_buf();
+    let rest = session_path
+        .strip_prefix(&shard)
+        .expect("the session inside its shard")
+        .to_path_buf();
+    let moved = outside.path().join("shard");
+    fs::rename(&shard, &moved).expect("move the shard out of the tree");
+    std::os::unix::fs::symlink(&moved, &shard).expect("symlink");
+
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    let log = moved
+        .join(rest)
+        .join("flags")
+        .join(flag.sparse_path())
+        .join("hits.log");
+    assert_eq!(
+        fs::read_to_string(&log)
+            .expect("read the log")
+            .lines()
+            .count(),
+        1,
+        "no hit was appended outside the store"
+    );
+}
+
+#[test]
+fn a_mapping_that_is_not_a_file_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let entry = dir.path().join("by-flag").join(flag.sparse_path());
+    fs::remove_file(&entry).expect("remove the mapping");
+    fs::create_dir(&entry).expect("put a directory where the mapping belongs");
+
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_flag_is_not_added_through_a_symlinked_flags_directory() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let outside = TempDir::new().expect("temp dir");
+    let flags = session_dir(dir.path(), &session).join("flags");
+    let moved = outside.path().join("flags");
+    fs::rename(&flags, &moved).expect("move flags out of the tree");
+    std::os::unix::fs::symlink(&moved, &flags).expect("symlink");
+
+    assert!(matches!(
+        store.flag_new(&session, "flag"),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(
+        moved
+            .read_dir()
+            .expect("read the moved flags")
+            .next()
+            .is_none(),
+        "nothing was created outside the store"
+    );
+}
+
+#[test]
+fn a_report_orders_a_full_tie_by_object_name() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+
+    // The same instant and the same counter: only the object names are left.
+    let instant = Timestamp::from_second(1_000).expect("instant").to_string();
+    for flag in [&first, &second] {
+        let path = flag_dir(dir.path(), &session, flag).join("meta.json");
+        let text = fs::read_to_string(&path).expect("read meta");
+        let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+        value["created"] = serde_json::Value::String(instant.clone());
+        value["counter"] = serde_json::Value::from(1);
+        fs::write(&path, format!("{value}\n")).expect("write meta");
+    }
+
+    let status = store.status(session.as_id()).expect("status");
+    let order: Vec<FlagId> = status.flags.iter().map(|flag| flag.id.clone()).collect();
+    let mut expected = vec![first, second];
+    expected.sort();
+    assert_eq!(order, expected, "a full tie is settled by object name");
 }

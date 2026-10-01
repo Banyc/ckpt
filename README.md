@@ -45,11 +45,14 @@ followed.
 
 Looking a flag up reads its mapping entry and then the flags of the session the
 mapping names, so it costs a file read and the owner's own flags instead of a
-walk over every session. Reads always come from disk; nothing is cached, so a
+walk over every session. The mapping is read by key rather than enumerated, so a
+name in `by-flag/` that nothing looks up is never read; an entry that is a
+directory, a link, or not a session id is reported when it is looked up. Reads always come from disk; nothing is cached, so a
 hit appended by another process is visible on the next read. A hit is written as
 one complete line in a single append, so concurrent verifications both land.
-`verify` prints the log's count when it reads back, and `status` is the
-authority on the total.
+`verify` prints the log's count when it reads back; if that read fails it says so
+on standard error and prints the count the append recorded instead, and `status`
+is the authority on the total.
 
 ## Commands
 
