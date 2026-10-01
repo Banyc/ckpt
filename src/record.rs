@@ -17,8 +17,9 @@ pub(crate) struct SessionMeta {
 pub(crate) struct FlagMeta {
     pub(crate) desc: String,
     pub(crate) created: Timestamp,
-    /// One past the flags the session held when this one was added. It orders
-    /// flags whose timestamps are equal.
+    /// The flags the session showed when this one was added, plus one. Two
+    /// additions that race can share it; a report orders by `created` first and
+    /// the object name last.
     pub(crate) counter: u64,
 }
 
@@ -55,8 +56,8 @@ pub struct FlagStatus {
     pub id: FlagId,
     pub desc: String,
     pub created: Timestamp,
-    /// One past the flags the session held when this one was added. Together
-    /// with `created` it orders the flags of a session.
+    /// The flags the session showed when this one was added, plus one. A
+    /// report's order uses it after `created`.
     pub counter: u64,
     /// How many verifications have been recorded.
     pub hits: u64,

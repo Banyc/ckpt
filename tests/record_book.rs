@@ -455,12 +455,20 @@ fn a_failed_verification_writes_nothing() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
     let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    // The flag's own log is the entry a rejected verification would have written
+    // to, so the assertion is about that entry and not about some other flag.
+    fs::write(&log, "{\"ts\":\"2030-01-01T00:00:00Z\"}").expect("write an unterminated line");
 
-    assert!(store.verify(&FlagId::generate(), &Verify::new()).is_err());
-
-    let log = fs::read_to_string(flag_dir(dir.path(), &session, &flag).join("hits.log"))
-        .expect("read hits");
-    assert_eq!(log, "", "a rejected verification leaves the log untouched");
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read hits"),
+        "{\"ts\":\"2030-01-01T00:00:00Z\"}",
+        "the rejected verification left this flag's log as it found it"
+    );
 }
 
 #[test]
@@ -720,13 +728,22 @@ fn a_flag_recorded_under_two_sessions_is_reported() {
         store.status(flag.as_id()),
         Err(Error::Corrupt { .. })
     ));
+    assert!(
+        matches!(store.status(first.as_id()), Err(Error::Corrupt { .. })),
+        "the session's own report would count it under both"
+    );
+    assert!(matches!(
+        store.status(second.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }
 
 #[test]
 fn a_foreign_entry_in_a_flag_shard_is_reported() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
-    store.flag_new(&session, "flag").expect("flag");
+    let flag = store.flag_new(&session, "flag").expect("flag");
     let shard = session_dir(dir.path(), &session).join("flags").join("ab");
     fs::create_dir_all(&shard).expect("create");
     fs::create_dir(shard.join("not-an-id")).expect("create foreign entry");
@@ -735,6 +752,17 @@ fn a_foreign_entry_in_a_flag_shard_is_reported() {
         store.status(session.as_id()),
         Err(Error::Corrupt { .. })
     ));
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a flag lookup reports the damaged shard too"
+    );
+    assert!(
+        matches!(
+            store.verify(&flag, &Verify::new()),
+            Err(Error::Corrupt { .. })
+        ),
+        "and a hit is not appended into a tree the reports call damaged"
+    );
 }
 
 #[test]
@@ -999,7 +1027,6 @@ fn an_empty_foreign_flag_shard_is_reported() {
 }
 
 #[test]
-#[cfg(unix)]
 fn a_flag_is_not_added_to_a_corrupt_session() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
@@ -1230,5 +1257,55 @@ fn an_unreadable_hit_log_is_reported() {
     assert!(
         matches!(store.status(flag.as_id()), Err(Error::Io { .. })),
         "a permission error is surfaced, not read as an empty log"
+    );
+}
+
+#[test]
+fn an_id_that_is_both_a_session_and_a_flag_is_reported() {
+    let (dir, store) = book();
+    let real = store.session_new("real").expect("session");
+    let flag = store.flag_new(&real, "flag").expect("flag");
+    let impostor = store.session_new("impostor").expect("session");
+
+    // Move the second session to the flag's object name, so one id names both.
+    let from = session_dir(dir.path(), &impostor);
+    let to = session_dir(dir.path(), &SessionId::from_id(flag.as_id().clone()));
+    fs::create_dir_all(to.parent().expect("parent")).expect("create");
+    fs::rename(&from, &to).expect("move the impostor session");
+
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+        "a flag id resolves to its own session or reports the collision"
+    );
+    assert!(store.verify(&flag, &Verify::new()).is_ok());
+}
+
+#[test]
+#[cfg(unix)]
+fn a_hard_link_at_a_hit_log_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+    let linked = flag_dir(dir.path(), &session, &second).join("hits.log");
+    fs::remove_file(&linked).expect("remove log");
+    fs::hard_link(
+        flag_dir(dir.path(), &session, &first).join("hits.log"),
+        &linked,
+    )
+    .expect("hard link the two logs");
+
+    assert!(
+        matches!(
+            store.verify(&second, &Verify::new()),
+            Err(Error::Corrupt { .. })
+        ),
+        "a hit is not appended into a log shared with another flag"
+    );
+    assert_eq!(
+        fs::read_to_string(flag_dir(dir.path(), &session, &first).join("hits.log"))
+            .expect("read the other log"),
+        "",
+        "the other flag's log gained nothing"
     );
 }

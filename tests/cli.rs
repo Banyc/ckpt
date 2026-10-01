@@ -284,3 +284,56 @@ fn concurrent_verifications_from_separate_processes_all_land() {
         "no line was torn by a concurrent process"
     );
 }
+
+#[test]
+fn concurrent_flag_additions_all_land() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+
+    let additions = 12;
+    let mut children = Vec::new();
+    for _ in 0..additions {
+        children.push(
+            Command::new(env!("CARGO_BIN_EXE_ckpt"))
+                .arg("--root")
+                .arg(root)
+                .args(["flag", "new", &session, "--desc", "f"])
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn ckpt"),
+        );
+    }
+    for mut child in children {
+        assert!(child.wait().expect("wait").success());
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(&ok(root, &["status", &session, "--json"])).expect("json status");
+    let flags = value["flags"].as_array().expect("flags");
+    assert_eq!(flags.len(), additions, "every flag landed");
+
+    let instants: Vec<jiff::Timestamp> = flags
+        .iter()
+        .map(|flag| {
+            flag["created"]
+                .as_str()
+                .expect("created")
+                .parse()
+                .expect("instant")
+        })
+        .collect();
+    assert!(
+        instants.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the report is ordered by instant"
+    );
+    assert!(
+        flags.iter().all(|flag| {
+            flag["counter"]
+                .as_u64()
+                .is_some_and(|counter| counter >= 1 && counter <= additions as u64)
+        }),
+        "a counter is a count the session held"
+    );
+}

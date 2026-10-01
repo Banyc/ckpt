@@ -182,17 +182,27 @@ impl Store {
 
     /// The status of the session `id` names, where `id` may be a session id or
     /// the id of any of that session's ctf flags.
+    ///
+    /// An id that names both a session and a ctf flag is reported rather than
+    /// resolved to one of them, so a flag id always leads to the session that
+    /// holds it.
     pub fn status(&self, id: &Id) -> Result<Status, Error> {
         let session = SessionId::from_id(id.clone());
-        if holds_record(&self.session_dir(&session))? {
-            return self.session_status(&session, Target::Session);
-        }
         let flag = FlagId::from_id(id.clone());
-        let owner = self.flag_owner(&flag)?.ok_or_else(|| Error::NotFound {
-            kind: "session or flag",
-            id: id.to_string(),
-        })?;
-        self.session_status(&owner, Target::Flag { id: flag })
+        let as_session = holds_record(&self.session_dir(&session))?;
+        let owner = self.flag_owner(&flag)?;
+        match (as_session, owner) {
+            (true, Some(other)) => Err(Error::Corrupt {
+                path: self.session_dir(&session),
+                detail: format!("`{id}` is both a session and a ctf flag recorded under {other}"),
+            }),
+            (true, None) => self.session_status(&session, Target::Session),
+            (false, Some(owner)) => self.session_status(&owner, Target::Flag { id: flag }),
+            (false, None) => Err(Error::NotFound {
+                kind: "session or flag",
+                id: id.to_string(),
+            }),
+        }
     }
 
     /// Every session in the record book, ordered by id.
@@ -266,24 +276,22 @@ impl Store {
 
     /// The one session a ctf flag is recorded under.
     ///
-    /// A flag is stored inside its session, so this walks the `flags/` entry of
-    /// every session: the tree is the index, and nothing is cached. The same
-    /// flag id recorded under two sessions is reported rather than resolved to
-    /// one of them, because a hit would otherwise land in whichever the walk
-    /// reached first.
+    /// A flag is stored inside its session, so this enumerates the flags of
+    /// every session: the tree is the index, and nothing is cached. Enumerating
+    /// them is also what validates each session's shards, so a damaged tree is
+    /// reported here the same way a report reports it, in place of a one-stat
+    /// probe that would answer "no such flag". The same flag id recorded under
+    /// two sessions is reported rather than resolved to one of them, because a
+    /// hit would otherwise land in whichever the walk reached first.
     fn flag_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
         let mut owner: Option<SessionId> = None;
         for session in self.session_ids()? {
-            // The session exists, so its `flags/` entry must too: a flag lookup
-            // reports a damaged tree instead of answering "no such flag".
-            require_directory(&self.flags_dir(&session))?;
-            let dir = self.flag_dir(&session, flag);
-            if !holds_record(&dir)? {
+            if !self.flag_ids(&session)?.contains(flag) {
                 continue;
             }
             if owner.is_some() {
                 return Err(Error::Corrupt {
-                    path: dir,
+                    path: self.flag_dir(&session, flag),
                     detail: format!("the flag `{flag}` is recorded under two sessions"),
                 });
             }
@@ -334,9 +342,7 @@ impl Store {
             }
             statuses.push(self.read_flag_status(session, &flag)?);
         }
-        statuses.sort_by(|left, right| {
-            (left.created, left.counter).cmp(&(right.created, right.counter))
-        });
+        statuses.sort_by(compare_status);
         Ok(statuses)
     }
 
@@ -509,19 +515,37 @@ fn create_record_dir(path: &Path) -> Result<(), Error> {
     }
 }
 
-/// Report a record file that is not a regular file.
+/// Report a record file that is not a regular file of its own.
 ///
-/// A link at `meta.json` or `hits.log` would let a read or an append land
-/// somewhere else in the filesystem.
+/// A link at `meta.json` or `hits.log` — a symlink, or a file with more than one
+/// hard link — would let a read or an append land somewhere else in the
+/// filesystem.
 fn require_regular_file(path: &Path) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(()),
-        Ok(_) => Err(Error::Corrupt {
+    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
+    if !metadata.is_file() {
+        return Err(Error::Corrupt {
             path: path.to_path_buf(),
             detail: "a record file must be a regular file".to_owned(),
-        }),
-        Err(err) => Err(Error::io(path, err)),
+        });
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if metadata.nlink() > 1 {
+            return Err(Error::Corrupt {
+                path: path.to_path_buf(),
+                detail: "a record file must not be linked to another file".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// A report's order: by instant, then by counter, and where both are equal the
+/// object name settles it, so a report reads the same way every time.
+fn compare_status(left: &FlagStatus, right: &FlagStatus) -> std::cmp::Ordering {
+    (left.created, left.counter, &left.id).cmp(&(right.created, right.counter, &right.id))
 }
 
 /// Report a shard directory whose name is not exactly two lowercase-hex
@@ -740,5 +764,53 @@ mod tests {
             sparse_id("ab", &"z".repeat(HEX_LEN - SHARD_LEN), path),
             Err(Error::Corrupt { .. })
         ));
+    }
+
+    fn status_at(created: i64, counter: u64, id: &str) -> FlagStatus {
+        FlagStatus {
+            id: FlagId::parse(id).expect("id"),
+            desc: String::new(),
+            created: Timestamp::from_second(created).expect("instant"),
+            counter,
+            hits: 0,
+            last_hit: None,
+        }
+    }
+
+    #[test]
+    fn a_report_orders_by_instant_then_counter_then_name() {
+        use std::cmp::Ordering;
+
+        let early = status_at(1_000, 2, &"1".repeat(40));
+        let late = status_at(2_000, 1, &"2".repeat(40));
+        assert_eq!(
+            compare_status(&early, &late),
+            Ordering::Less,
+            "the instant decides first"
+        );
+
+        let first = status_at(1_000, 1, &"3".repeat(40));
+        let second = status_at(1_000, 2, &"0".repeat(40));
+        assert_eq!(
+            compare_status(&first, &second),
+            Ordering::Less,
+            "the counter breaks a tie"
+        );
+
+        let lower = status_at(1_000, 1, &"0".repeat(40));
+        let higher = status_at(1_000, 1, &"1".repeat(40));
+        assert_eq!(
+            compare_status(&lower, &higher),
+            Ordering::Less,
+            "the object name settles what is still equal"
+        );
+    }
+
+    #[test]
+    fn a_record_write_failure_is_reported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("missing").join("meta.json");
+
+        assert!(matches!(write_record(&path, &1u64), Err(Error::Io { .. })));
     }
 }

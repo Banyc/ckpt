@@ -29,9 +29,11 @@ A session exists once its `meta.json` does; a ctf flag exists once its own
 `meta.json` does. Dotfiles in these directories are left alone, so an operating
 system droppings file does not disturb a read.
 
-A ctf flag's `counter` is one past the flags the session held when it was added.
-A report lists a session's flags by `created` and then by `counter`, so the order
-follows the order they were added.
+A ctf flag's `counter` is the flags the session showed when it was added, plus
+one. A report lists a session's flags by `created`, then by `counter`, and then
+by object name. Two additions that race each other can take the same counter, so
+the order a report shows is the order the flags were added except where two of
+them landed in the same instant.
 
 Because a flag is stored inside its session, looking a flag up walks the
 `flags/` entry of every session. Reads always come from disk; nothing is cached,
