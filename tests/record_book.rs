@@ -1095,3 +1095,64 @@ fn a_symlinked_meta_is_not_read_through() {
         "a borrowed record is refused"
     );
 }
+
+fn meta_of(root: &Path, session: &SessionId, flag: &FlagId) -> PathBuf {
+    flag_dir(root, session, flag).join("meta.json")
+}
+
+fn set_created(path: &Path, second: i64) {
+    let text = fs::read_to_string(path).expect("read meta");
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("meta json");
+    value["created"] = serde_json::Value::String(
+        Timestamp::from_second(second)
+            .expect("valid instant")
+            .to_string(),
+    );
+    fs::write(path, format!("{value}\n")).expect("write meta");
+}
+
+#[test]
+fn flags_are_ordered_by_instant_then_counter() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+    let third = store.flag_new(&session, "third").expect("flag");
+
+    let status = store.status(session.as_id()).expect("status");
+    let order: Vec<&FlagId> = status.flags.iter().map(|flag| &flag.id).collect();
+    assert_eq!(order, vec![&first, &second, &third], "creation order");
+    let counters: Vec<u64> = status.flags.iter().map(|flag| flag.counter).collect();
+    assert_eq!(counters, vec![1, 2, 3]);
+
+    // Hand-set instants: the later instant comes last whatever the counter says,
+    // and flags sharing an instant are ordered by the counter.
+    set_created(&meta_of(dir.path(), &session, &first), 2_000);
+    set_created(&meta_of(dir.path(), &session, &second), 1_000);
+    set_created(&meta_of(dir.path(), &session, &third), 1_000);
+
+    let status = store.status(session.as_id()).expect("status");
+    let order: Vec<&FlagId> = status.flags.iter().map(|flag| &flag.id).collect();
+    assert_eq!(
+        order,
+        vec![&second, &third, &first],
+        "instant first, counter where instants are equal"
+    );
+}
+
+#[test]
+fn a_flag_meta_without_a_counter_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        meta_of(dir.path(), &session, &flag),
+        "{\"desc\":\"flag\",\"created\":\"2030-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write meta without a counter");
+
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}

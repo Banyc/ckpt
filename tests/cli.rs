@@ -68,17 +68,23 @@ fn json_reports_carry_the_id_they_matched() {
     let flag = ok(root, &["flag", "new", session.trim(), "--desc", "f"]);
     let flag = flag.trim().to_owned();
     ok(root, &["verify", &flag]);
+    ok(root, &["flag", "new", session.trim(), "--desc", "second"]);
 
     let value: serde_json::Value =
         serde_json::from_str(&ok(root, &["status", &flag, "--json"])).expect("json status");
     assert_eq!(value["matched"]["kind"], "flag");
     assert_eq!(value["matched"]["id"], flag.as_str());
     assert_eq!(value["flags"][0]["hits"], 1);
+    assert_eq!(value["flags"][0]["counter"], 1);
+    assert_eq!(
+        value["flags"][1]["counter"], 2,
+        "a report carries the counters in order"
+    );
 
     let listed: serde_json::Value =
         serde_json::from_str(&ok(root, &["session", "list", "--json"])).expect("json list");
     assert_eq!(listed[0]["hits"], 1);
-    assert_eq!(listed[0]["flags"], 1);
+    assert_eq!(listed[0]["flags"], 2);
 }
 
 #[test]

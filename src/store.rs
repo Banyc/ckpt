@@ -33,10 +33,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::error::Error;
 use crate::id::{FlagId, HEX_LEN, Id, SHARD_LEN, SessionId};
-use crate::record::{FlagStatus, Hit, Meta, SessionSummary, Status, Target};
+use crate::record::{FlagMeta, FlagStatus, Hit, SessionMeta, SessionSummary, Status, Target};
 
 /// Settings for [`Store::verify`].
 #[derive(Clone, Debug)]
@@ -101,7 +103,7 @@ impl Store {
         let dir = self.session_dir(&session);
         create_record_dir(&dir)?;
         ensure_directory(&self.flags_dir(&session))?;
-        write_meta(&dir, desc)?;
+        write_record(&meta_path(&dir), &new_session_meta(desc))?;
         Ok(session)
     }
 
@@ -116,7 +118,7 @@ impl Store {
         }
         // The session's own `meta.json` must parse: a flag is not added to a
         // record that already reads as corrupt.
-        read_meta(&dir)?;
+        read_session_meta(&dir)?;
         // The `flags/` entry belongs to the session. A missing or foreign one
         // is reported rather than created here, so a write never heals a
         // damaged tree behind the read paths' back.
@@ -128,7 +130,15 @@ impl Store {
         create_record_dir(&flag_dir)?;
         let hits = hits_path(&flag_dir);
         File::create(&hits).map_err(|err| Error::io(&hits, err))?;
-        write_meta(&flag_dir, desc)?;
+        let counter = self.flag_ids(session)?.len() as u64 + 1;
+        write_record(
+            &meta_path(&flag_dir),
+            &FlagMeta {
+                desc: desc.to_owned(),
+                created: Timestamp::now(),
+                counter,
+            },
+        )?;
         Ok(flag)
     }
 
@@ -152,7 +162,7 @@ impl Store {
 
         // Read before writing: a damaged log is reported without a hit having
         // been appended.
-        let meta = read_meta(&dir)?;
+        let meta = read_flag_meta(&dir)?;
         let hits = read_hits(&hits_path(&dir))?.len() as u64 + 1;
         let hit = Hit {
             ts: settings.at.unwrap_or_else(Timestamp::now),
@@ -164,6 +174,7 @@ impl Store {
             id: flag.clone(),
             desc: meta.desc,
             created: meta.created,
+            counter: meta.counter,
             hits,
             last_hit: Some(hit.ts),
         })
@@ -189,7 +200,7 @@ impl Store {
         let mut summaries = Vec::new();
         for session in self.session_ids()? {
             let flags = self.flag_statuses(&session)?;
-            let meta = read_meta(&self.session_dir(&session))?;
+            let meta = read_session_meta(&self.session_dir(&session))?;
             summaries.push(SessionSummary {
                 session,
                 desc: meta.desc,
@@ -283,26 +294,34 @@ impl Store {
 
     fn flag_status(&self, session: &SessionId, flag: &FlagId) -> Result<FlagStatus, Error> {
         let dir = self.flag_dir(session, flag);
-        let meta = read_meta(&dir)?;
+        let meta = read_flag_meta(&dir)?;
         let hits = read_hits(&hits_path(&dir))?;
         Ok(FlagStatus {
             id: flag.clone(),
             desc: meta.desc,
             created: meta.created,
+            counter: meta.counter,
             hits: hits.len() as u64,
             last_hit: hits.last().map(|hit| hit.ts),
         })
     }
 
+    /// A session's flags in the order they were added: by timestamp, and by the
+    /// counter where two timestamps are equal.
     fn flag_statuses(&self, session: &SessionId) -> Result<Vec<FlagStatus>, Error> {
-        self.flag_ids(session)?
+        let mut statuses: Vec<FlagStatus> = self
+            .flag_ids(session)?
             .iter()
             .map(|flag| self.flag_status(session, flag))
-            .collect()
+            .collect::<Result<_, _>>()?;
+        statuses.sort_by(|left, right| {
+            (left.created, left.counter).cmp(&(right.created, right.counter))
+        });
+        Ok(statuses)
     }
 
     fn session_status(&self, session: &SessionId, matched: Target) -> Result<Status, Error> {
-        let meta = read_meta(&self.session_dir(session))?;
+        let meta = read_session_meta(&self.session_dir(session))?;
         Ok(Status {
             session: session.clone(),
             desc: meta.desc,
@@ -538,38 +557,47 @@ fn hits_path(dir: &Path) -> PathBuf {
     dir.join("hits.log")
 }
 
-fn read_meta(dir: &Path) -> Result<Meta, Error> {
-    let path = meta_path(dir);
-    require_regular_file(&path)?;
-    let text = fs::read_to_string(&path).map_err(|err| Error::io(&path, err))?;
+fn read_session_meta(dir: &Path) -> Result<SessionMeta, Error> {
+    read_record(&meta_path(dir))
+}
+
+fn read_flag_meta(dir: &Path) -> Result<FlagMeta, Error> {
+    read_record(&meta_path(dir))
+}
+
+fn new_session_meta(desc: &str) -> SessionMeta {
+    SessionMeta {
+        desc: desc.to_owned(),
+        created: Timestamp::now(),
+    }
+}
+
+fn read_record<T: DeserializeOwned>(path: &Path) -> Result<T, Error> {
+    require_regular_file(path)?;
+    let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
     serde_json::from_str(&text).map_err(|err| Error::Corrupt {
-        path,
+        path: path.to_path_buf(),
         detail: err.to_string(),
     })
 }
 
-fn write_meta(dir: &Path, desc: &str) -> Result<(), Error> {
-    let path = meta_path(dir);
-    match fs::symlink_metadata(&path) {
+fn write_record<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => {}
         Ok(_) => {
             return Err(Error::Corrupt {
-                path,
+                path: path.to_path_buf(),
                 detail: "a record file must be a regular file".to_owned(),
             });
         }
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::io(&path, err)),
+        Err(err) => return Err(Error::io(path, err)),
     }
-    let meta = Meta {
-        desc: desc.to_owned(),
-        created: Timestamp::now(),
-    };
-    let text = serde_json::to_string(&meta).map_err(|err| Error::Corrupt {
-        path: path.clone(),
+    let text = serde_json::to_string(value).map_err(|err| Error::Corrupt {
+        path: path.to_path_buf(),
         detail: err.to_string(),
     })?;
-    fs::write(&path, format!("{text}\n")).map_err(|err| Error::io(&path, err))
+    fs::write(path, format!("{text}\n")).map_err(|err| Error::io(path, err))
 }
 
 /// The hits in a log.

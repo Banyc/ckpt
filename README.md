@@ -21,13 +21,17 @@ entry:
 <root>/sessions/<a>/<b>/
     meta.json                       {"desc": "...", "created": "2026-10-01T12:00:00Z"}
     flags/<a>/<b>/
-        meta.json
+        meta.json                   {"desc": "...", "created": "...", "counter": 1}
         hits.log                    one JSON line per verification
 ```
 
 A session exists once its `meta.json` does; a ctf flag exists once its own
 `meta.json` does. Dotfiles in these directories are left alone, so an operating
 system droppings file does not disturb a read.
+
+A ctf flag's `counter` is one past the flags the session held when it was added.
+A report lists a session's flags by `created` and then by `counter`, so the order
+follows the order they were added.
 
 Because a flag is stored inside its session, looking a flag up walks the
 `flags/` entry of every session. Reads always come from disk; nothing is cached,
