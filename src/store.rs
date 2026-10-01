@@ -148,8 +148,26 @@ impl Store {
         // The mapping is written first, so a refusal there leaves nothing of the
         // flag behind: what can be refused is refused before anything is made.
         self.write_owner(session, &flag)?;
-        let flag_dir = self.flag_dir(session, &flag);
-        sparse::ensure_directory(&self.flag_shard_dir(session, &flag))?;
+        if let Err(err) = self.write_flag_record(session, &flag, desc, counter) {
+            // The entry is this call's own, created under a name that must not
+            // exist, so taking it back cannot take a record that belongs to
+            // someone else. What remains is a directory with no record in it,
+            // which every read treats as absent.
+            return Err(self.take_back_mapping(&flag, err));
+        }
+        Ok(flag)
+    }
+
+    /// Write the record of a ctf flag whose mapping is already in place.
+    fn write_flag_record(
+        &self,
+        session: &SessionId,
+        flag: &FlagId,
+        desc: &str,
+        counter: u64,
+    ) -> Result<(), Error> {
+        let flag_dir = self.flag_dir(session, flag);
+        sparse::ensure_directory(&self.flag_shard_dir(session, flag))?;
         sparse::create_record_dir(&flag_dir)?;
         let hits = hits_path(&flag_dir);
         sparse::write_new_file(&hits, "")?;
@@ -160,8 +178,26 @@ impl Store {
                 created: Timestamp::now(),
                 counter,
             },
-        )?;
-        Ok(flag)
+        )
+    }
+
+    /// Remove the mapping entry an addition left when the rest of it failed.
+    ///
+    /// The failure is the one that is reported; a mapping entry that could not be
+    /// removed is reported with it, because that entry is what makes an id name
+    /// a flag.
+    fn take_back_mapping(&self, flag: &FlagId, err: Error) -> Error {
+        let path = self.owner_path(flag);
+        match fs::remove_file(&path) {
+            Ok(()) => err,
+            Err(undo) => Error::io(
+                &path,
+                io::Error::new(
+                    undo.kind(),
+                    format!("{err}; and the mapping entry could not be removed: {undo}"),
+                ),
+            ),
+        }
     }
 
     /// Append one verification hit for `flag` and report its count.
@@ -364,11 +400,12 @@ impl Store {
 
     /// The one session a ctf flag is recorded under.
     ///
-    /// The mapping says who holds it, and the answer is checked against the
+    /// The mapping says who holds it, and that statement is checked against the
     /// owner's own record: the session must read, and its flags are walked the
     /// way a report walks them, so a lookup never calls a damaged tree fine. An
-    /// entry whose session does not hold the flag is a leftover from an
-    /// interrupted addition, and answers "no such flag".
+    /// entry whose session does not hold the flag is the book saying a flag is
+    /// there when it is not, and is reported; an id with no entry at all is not
+    /// a flag, and is not found.
     fn flag_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
         let Some(session) = self.read_owner(flag)? else {
             return Ok(None);
@@ -382,19 +419,27 @@ impl Store {
                 detail: format!("`{flag}` is both a session and a ctf flag"),
             });
         }
-        // The owner must be a record the same checks accept, and its flags are
-        // read the way a report reads them, so a lookup never calls a damaged
-        // session fine and a hit is never written into one.
+        // The owner must be a record that reads, so a hit is not written into a
+        // session every report calls corrupt.
         if !holds_record(&self.session_dir(&session))? {
-            return Ok(None);
+            return Err(Error::Corrupt {
+                path: self.owner_path(flag),
+                detail: format!("`{flag}` is mapped to a session that is not a record"),
+            });
         }
         read_session_meta(&self.session_dir(&session))?;
+        // Its flags are read the way a report reads them, and the mapping has to
+        // name one of them: a mapping without its flag is reported, not passed
+        // over as an absent flag.
         if !self
             .flag_statuses(&session)?
             .iter()
             .any(|status| &status.id == flag)
         {
-            return Ok(None);
+            return Err(Error::Corrupt {
+                path: self.owner_path(flag),
+                detail: format!("`{flag}` is mapped to a session that does not hold it"),
+            });
         }
         Ok(Some(session))
     }
@@ -584,7 +629,9 @@ fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
     // nothing landed after it the log is put back exactly as it was, so a failed
     // append leaves the record readable; when something did land after it the
     // partial line is reported instead, because shortening the log would remove
-    // another writer's record.
+    // another writer's record. The check and the shortening are two steps, so a
+    // writer that appends in that instant can still be shortened with it: a
+    // short write under concurrent appends is the one case this cannot repair.
     let length = file.metadata().map_err(|err| Error::io(path, err))?.len();
     if length == before + written as u64 {
         file.set_len(before).map_err(|err| Error::io(path, err))?;

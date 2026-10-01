@@ -547,15 +547,15 @@ fn a_blank_hit_line_is_reported() {
 }
 
 #[test]
-fn a_flag_under_a_session_without_meta_is_not_found() {
+fn a_flag_under_a_session_without_meta_is_reported() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
     let flag = store.flag_new(&session, "flag").expect("flag");
     fs::remove_file(session_dir(dir.path(), &session).join("meta.json")).expect("remove meta");
 
     assert!(
-        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
-        "a session exists once its meta.json does, so its flags are not reachable"
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+        "the mapping names a flag whose session is not a record"
     );
     assert!(matches!(
         store.flag_new(&session, "another"),
@@ -1375,16 +1375,16 @@ fn a_flag_the_mapping_does_not_name_is_reported() {
 }
 
 #[test]
-fn a_mapping_whose_flag_is_gone_answers_not_found() {
+fn a_mapping_whose_flag_is_gone_is_reported() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
     let flag = store.flag_new(&session, "flag").expect("flag");
     fs::remove_dir_all(flag_dir(dir.path(), &session, &flag)).expect("remove the flag");
 
-    assert!(matches!(
-        store.status(flag.as_id()),
-        Err(Error::NotFound { .. })
-    ));
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+        "the mapping says a flag is there and the tree says otherwise"
+    );
     assert!(
         store
             .status(session.as_id())
@@ -1412,7 +1412,7 @@ fn a_mapping_that_names_another_session_is_reported() {
         "the session holding a flag it is not mapped to is reported"
     );
     assert!(
-        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
         "the named session does not hold it"
     );
 }
@@ -2012,6 +2012,18 @@ fn an_unknown_field_in_a_record_is_read_past() {
         status.flags[0].hits, 1,
         "the fields this version knows are read, the rest are passed over"
     );
+
+    // The same for a record of the book itself.
+    let session_meta = session_dir(dir.path(), &session).join("meta.json");
+    fs::write(
+        &session_meta,
+        "{\"desc\":\"session\",\"created\":\"2030-01-01T00:00:00Z\",\"extra\":1}\n",
+    )
+    .expect("write a session record with an unknown field");
+    assert_eq!(
+        store.status(session.as_id()).expect("status").desc,
+        "session"
+    );
 }
 
 #[test]
@@ -2064,12 +2076,12 @@ fn a_mapping_naming_a_session_that_holds_other_flags_is_reported() {
     .expect("point the mapping at the other session");
 
     assert!(
-        matches!(store.flag_status(&wanted), Err(Error::NotFound { .. })),
+        matches!(store.flag_status(&wanted), Err(Error::Corrupt { .. })),
         "the named session does not hold this flag, whatever else it holds"
     );
     assert!(matches!(
         store.status(wanted.as_id()),
-        Err(Error::NotFound { .. })
+        Err(Error::Corrupt { .. })
     ));
 }
 
@@ -2088,6 +2100,15 @@ fn a_hard_link_at_a_meta_is_reported() {
     );
     assert!(matches!(
         store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+
+    // The same for a session's own record.
+    let other = store.session_new("other").expect("session");
+    let meta = session_dir(dir.path(), &other).join("meta.json");
+    fs::hard_link(&meta, dir.path().join("elsewhere2.json")).expect("hard link the session meta");
+    assert!(matches!(
+        store.status(other.as_id()),
         Err(Error::Corrupt { .. })
     ));
 }
@@ -2124,7 +2145,7 @@ fn a_rejected_addition_leaves_no_directory_behind() {
 
 #[test]
 #[cfg(unix)]
-fn a_failed_addition_leaves_only_an_inert_remnant() {
+fn a_failed_addition_takes_its_mapping_back() {
     use std::os::unix::fs::PermissionsExt;
 
     let (dir, store) = book();
