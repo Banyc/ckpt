@@ -332,3 +332,143 @@ fn sessions_are_listed_with_their_totals() {
         "sessions are ordered by id"
     );
 }
+
+#[test]
+fn concurrent_verifications_all_land_intact() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    let threads = 16;
+    let per_thread = 50;
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                for _ in 0..per_thread {
+                    store.verify(&flag, &Verify::new()).expect("verify");
+                }
+            });
+        }
+    });
+
+    let expected = (threads * per_thread) as u64;
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.flags[0].hits, expected);
+
+    let log = fs::read_to_string(flag_dir(dir.path(), &session, &flag).join("hits.log"))
+        .expect("read hits");
+    let lines: Vec<&str> = log.lines().filter(|line| !line.trim().is_empty()).collect();
+    assert_eq!(lines.len() as u64, expected, "one line per verification");
+    assert!(
+        lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "no line was torn by a concurrent append"
+    );
+}
+
+#[test]
+fn a_non_canonical_path_split_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flat = session.as_id().as_str().to_owned();
+
+    // The same object name spelled with a 1/39 split instead of 2/38.
+    let dir_1_39 = dir
+        .path()
+        .join("sessions")
+        .join(&flat[..1])
+        .join(&flat[1..]);
+    fs::create_dir_all(&dir_1_39).expect("create");
+    fs::copy(
+        session_dir(dir.path(), &session).join("meta.json"),
+        dir_1_39.join("meta.json"),
+    )
+    .expect("copy meta");
+
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "a second spelling of the same id is a foreign entry, not a second session"
+    );
+}
+
+#[test]
+fn a_non_canonical_directory_case_is_reported() {
+    let (dir, store) = book();
+    let rest = dir.path().join("sessions").join("F2").join("0".repeat(38));
+    fs::create_dir_all(&rest).expect("create");
+    fs::write(rest.join("meta.json"), "{}").expect("write meta");
+
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_missing_flag_directory_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    fs::remove_dir_all(session_dir(dir.path(), &session).join("flags")).expect("remove flags");
+
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Io { .. })),
+        "a session whose flags/ is gone is a broken record, not an empty one"
+    );
+    assert!(matches!(store.sessions(), Err(Error::Io { .. })));
+}
+
+#[test]
+fn a_missing_hit_log_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    fs::remove_file(flag_dir(dir.path(), &session, &flag).join("hits.log")).expect("remove log");
+
+    assert!(matches!(store.status(flag.as_id()), Err(Error::Io { .. })));
+}
+
+#[test]
+fn a_failed_verification_writes_nothing() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    assert!(store.verify(&FlagId::generate(), &Verify::new()).is_err());
+
+    let log = fs::read_to_string(flag_dir(dir.path(), &session, &flag).join("hits.log"))
+        .expect("read hits");
+    assert_eq!(log, "", "a rejected verification leaves the log untouched");
+}
+
+#[test]
+fn descriptions_round_trip() {
+    for desc in ["", "unicode: σ 性能", &"x".repeat(4096)] {
+        let (_, store) = book();
+        let session = store.session_new(desc).expect("session");
+        store.flag_new(&session, desc).expect("flag");
+
+        let status = store.status(session.as_id()).expect("status");
+        assert_eq!(status.desc, desc);
+        assert_eq!(status.flags[0].desc, desc);
+    }
+}
+
+#[test]
+fn a_flag_lookup_counts_only_its_own_session() {
+    let (_, store) = book();
+    let first = store.session_new("first").expect("session");
+    let second = store.session_new("second").expect("session");
+    let first_flag = store.flag_new(&first, "a").expect("flag");
+    let second_flag = store.flag_new(&second, "b").expect("flag");
+    verify_at(&store, &first_flag, 1_000);
+    verify_at(&store, &first_flag, 1_001);
+    verify_at(&store, &second_flag, 1_002);
+
+    let status = store.status(second_flag.as_id()).expect("status");
+    assert_eq!(status.session, second);
+    assert_eq!(status.flags.len(), 1);
+    assert_eq!(status.flags[0].id, second_flag);
+    assert_eq!(status.flags[0].hits, 1);
+}

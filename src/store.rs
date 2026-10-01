@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use jiff::Timestamp;
 
 use crate::error::Error;
-use crate::id::{FlagId, HEX_LEN, Id, SessionId};
+use crate::id::{FlagId, HEX_LEN, Id, SHARD_LEN, SessionId};
 use crate::record::{FlagStatus, Hit, Meta, SessionSummary, Status, Target};
 
 /// Settings for [`Store::verify`].
@@ -162,8 +162,8 @@ impl Store {
 
     fn session_ids(&self) -> Result<Vec<SessionId>, Error> {
         let mut ids = Vec::new();
-        for (shard, shard_path) in owned_entries(&self.sessions_dir())? {
-            for (rest, rest_path) in owned_entries(&shard_path)? {
+        for (shard, shard_path) in owned_entries(&self.sessions_dir(), Missing::Empty)? {
+            for (rest, rest_path) in owned_entries(&shard_path, Missing::Empty)? {
                 let session = SessionId::from_id(sparse_id(&shard, &rest, &rest_path)?);
                 if meta_path(&self.session_dir(&session)).is_file() {
                     ids.push(session);
@@ -175,8 +175,8 @@ impl Store {
 
     fn flag_ids(&self, session: &SessionId) -> Result<Vec<FlagId>, Error> {
         let mut ids = Vec::new();
-        for (shard, shard_path) in owned_entries(&self.flags_dir(session))? {
-            for (rest, rest_path) in owned_entries(&shard_path)? {
+        for (shard, shard_path) in owned_entries(&self.flags_dir(session), Missing::Error)? {
+            for (rest, rest_path) in owned_entries(&shard_path, Missing::Error)? {
                 let flag = FlagId::from_id(sparse_id(&shard, &rest, &rest_path)?);
                 if meta_path(&self.flag_dir(session, &flag)).is_file() {
                     ids.push(flag);
@@ -231,14 +231,27 @@ impl Store {
     }
 }
 
+/// What an absent directory means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Missing {
+    /// Absent and empty are the same thing: the store root before its first
+    /// session.
+    Empty,
+    /// Absent is a broken record: the directory belongs to a session that is
+    /// already there.
+    Error,
+}
+
 /// The non-dot entries of a directory the store owns, sorted by name.
 ///
-/// A missing directory is an empty one. Dotfiles belong to the operating system
-/// and are skipped; every other entry must be an object name.
-fn owned_entries(dir: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
+/// Dotfiles belong to the operating system and are skipped; every other entry
+/// must be an object name.
+fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>, Error> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound && missing == Missing::Empty => {
+            return Ok(Vec::new());
+        }
         Err(err) => return Err(Error::io(dir, err)),
     };
     let mut owned = Vec::new();
@@ -260,11 +273,33 @@ fn owned_entries(dir: &Path) -> Result<Vec<(String, PathBuf)>, Error> {
 }
 
 /// Reassemble the object name a sparse directory pair spells out.
+///
+/// The layout is exactly two lowercase-hex characters over the remaining 38.
+/// Any other split or case is a foreign entry rather than a second spelling of
+/// an id that is already stored, and is reported as such.
 fn sparse_id(shard: &str, rest: &str, path: &Path) -> Result<Id, Error> {
+    let canonical = shard.len() == SHARD_LEN
+        && rest.len() == HEX_LEN - SHARD_LEN
+        && is_lowercase_hex(shard)
+        && is_lowercase_hex(rest);
+    if !canonical {
+        return Err(Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: format!(
+                "`{shard}/{rest}` is not a {SHARD_LEN}/{}-character lowercase hex object name",
+                HEX_LEN - SHARD_LEN
+            ),
+        });
+    }
     Id::parse(&format!("{shard}{rest}")).map_err(|_| Error::Corrupt {
         path: path.to_path_buf(),
-        detail: format!("`{shard}/{rest}` is not a {HEX_LEN}-character hex object name"),
+        detail: format!("`{shard}/{rest}` is not an object name"),
     })
+}
+
+fn is_lowercase_hex(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn meta_path(dir: &Path) -> PathBuf {
@@ -310,16 +345,29 @@ fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
         .collect()
 }
 
-/// Append one hit as a single line. `O_APPEND` makes the write atomic, so two
-/// concurrent verifications both land and no hit is lost to a rewrite.
+/// Append one hit as a single complete line.
+///
+/// The whole line is built in one buffer and handed to one `write` call, and
+/// `O_APPEND` makes the offset update and that write atomic, so two concurrent
+/// verifications cannot interleave halves of a line.
 fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
-    let line = serde_json::to_string(hit).map_err(|err| Error::Corrupt {
+    let mut line = serde_json::to_string(hit).map_err(|err| Error::Corrupt {
         path: path.to_path_buf(),
         detail: err.to_string(),
     })?;
+    line.push('\n');
     let mut file = OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|err| Error::io(path, err))?;
-    writeln!(file, "{line}").map_err(|err| Error::io(path, err))
+    let written = file
+        .write(line.as_bytes())
+        .map_err(|err| Error::io(path, err))?;
+    if written != line.len() {
+        return Err(Error::io(
+            path,
+            io::Error::new(io::ErrorKind::WriteZero, "short append to the hit log"),
+        ));
+    }
+    Ok(())
 }

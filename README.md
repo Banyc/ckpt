@@ -31,8 +31,9 @@ system droppings file does not disturb a read.
 
 Because a flag is stored inside its session, looking a flag up walks the
 `flags/` entry of every session. Reads always come from disk; nothing is cached,
-so a hit appended by another process is visible on the next read. A hit is one
-appended line, so concurrent verifications both land.
+so a hit appended by another process is visible on the next read. A hit is
+written as one complete line in a single append, so concurrent verifications both
+land.
 
 ## Commands
 
