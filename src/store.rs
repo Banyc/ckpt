@@ -37,8 +37,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::Error;
-use crate::id::{FlagId, HEX_LEN, Id, SHARD_LEN, SessionId};
+use crate::id::{FlagId, Id, SessionId};
 use crate::record::{FlagMeta, FlagStatus, Hit, SessionMeta, SessionSummary, Status, Target};
+use crate::sparse::{self, Missing};
 
 /// Settings for [`Store::verify`].
 #[derive(Clone, Debug)]
@@ -98,11 +99,11 @@ impl Store {
     pub fn session_new(&self, desc: &str) -> Result<SessionId, Error> {
         let session = SessionId::generate();
         fs::create_dir_all(&self.root).map_err(|err| Error::io(&self.root, err))?;
-        ensure_directory(&self.sessions_dir())?;
-        ensure_directory(&self.session_shard_dir(&session))?;
+        sparse::ensure_directory(&self.sessions_dir())?;
+        sparse::ensure_directory(&self.session_shard_dir(&session))?;
         let dir = self.session_dir(&session);
-        create_record_dir(&dir)?;
-        ensure_directory(&self.flags_dir(&session))?;
+        sparse::create_record_dir(&dir)?;
+        sparse::ensure_directory(&self.flags_dir(&session))?;
         write_record(&meta_path(&dir), &new_session_meta(desc))?;
         Ok(session)
     }
@@ -122,12 +123,12 @@ impl Store {
         // The `flags/` entry belongs to the session. A missing or foreign one
         // is reported rather than created here, so a write never heals a
         // damaged tree behind the read paths' back.
-        require_directory(&self.flags_dir(session))?;
+        sparse::require_directory(&self.flags_dir(session))?;
 
         let flag = FlagId::generate();
         let flag_dir = self.flag_dir(session, &flag);
-        ensure_directory(&self.flag_shard_dir(session, &flag))?;
-        create_record_dir(&flag_dir)?;
+        sparse::ensure_directory(&self.flag_shard_dir(session, &flag))?;
+        sparse::create_record_dir(&flag_dir)?;
         let hits = hits_path(&flag_dir);
         File::create(&hits).map_err(|err| Error::io(&hits, err))?;
         let counter = self.flag_ids(session)?.len() as u64 + 1;
@@ -227,7 +228,8 @@ impl Store {
     }
 
     fn session_shard_dir(&self, session: &SessionId) -> PathBuf {
-        self.sessions_dir().join(session.as_id().sparse().0)
+        self.sessions_dir()
+            .join(sparse::components(session.as_id()).0)
     }
 
     fn session_dir(&self, session: &SessionId) -> PathBuf {
@@ -239,7 +241,8 @@ impl Store {
     }
 
     fn flag_shard_dir(&self, session: &SessionId, flag: &FlagId) -> PathBuf {
-        self.flags_dir(session).join(flag.as_id().sparse().0)
+        self.flags_dir(session)
+            .join(sparse::components(flag.as_id()).0)
     }
 
     fn flag_dir(&self, session: &SessionId, flag: &FlagId) -> PathBuf {
@@ -248,10 +251,10 @@ impl Store {
 
     fn session_ids(&self) -> Result<Vec<SessionId>, Error> {
         let mut ids = Vec::new();
-        for (shard, shard_path) in owned_entries(&self.sessions_dir(), Missing::Empty)? {
-            require_shard(&shard, &shard_path)?;
-            for (rest, rest_path) in owned_entries(&shard_path, Missing::Empty)? {
-                let session = SessionId::from_id(sparse_id(&shard, &rest, &rest_path)?);
+        for (shard, shard_path) in sparse::entries(&self.sessions_dir(), Missing::Empty)? {
+            sparse::require_shard(&shard, &shard_path)?;
+            for (rest, rest_path) in sparse::entries(&shard_path, Missing::Empty)? {
+                let session = SessionId::from_id(sparse::sparse_id(&shard, &rest, &rest_path)?);
                 if holds_record(&rest_path)? {
                     ids.push(session);
                 }
@@ -262,10 +265,10 @@ impl Store {
 
     fn flag_ids(&self, session: &SessionId) -> Result<Vec<FlagId>, Error> {
         let mut ids = Vec::new();
-        for (shard, shard_path) in owned_entries(&self.flags_dir(session), Missing::Error)? {
-            require_shard(&shard, &shard_path)?;
-            for (rest, rest_path) in owned_entries(&shard_path, Missing::Error)? {
-                let flag = FlagId::from_id(sparse_id(&shard, &rest, &rest_path)?);
+        for (shard, shard_path) in sparse::entries(&self.flags_dir(session), Missing::Error)? {
+            sparse::require_shard(&shard, &shard_path)?;
+            for (rest, rest_path) in sparse::entries(&shard_path, Missing::Error)? {
+                let flag = FlagId::from_id(sparse::sparse_id(&shard, &rest, &rest_path)?);
                 if holds_record(&rest_path)? {
                     ids.push(flag);
                 }
@@ -358,60 +361,6 @@ impl Store {
     }
 }
 
-/// What an absent directory means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Missing {
-    /// Absent and empty are the same thing: the store root before its first
-    /// session.
-    Empty,
-    /// Absent is a broken record: the directory belongs to a session that is
-    /// already there.
-    Error,
-}
-
-/// The non-dot entries of a directory the store owns, sorted by name.
-///
-/// Dotfiles belong to the operating system and are skipped; every other entry
-/// must be an object name. A path that is not a real directory is a foreign
-/// entry, whether it is a file, a symlink to a directory, or a dangling
-/// symlink.
-fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>, Error> {
-    match fs::symlink_metadata(dir) {
-        Ok(metadata) => {
-            if !metadata.is_dir() {
-                return Err(Error::Corrupt {
-                    path: dir.to_path_buf(),
-                    detail: "a store directory must be a real directory".to_owned(),
-                });
-            }
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            if missing == Missing::Empty {
-                return Ok(Vec::new());
-            }
-        }
-        Err(err) => return Err(Error::io(dir, err)),
-    }
-
-    let entries = fs::read_dir(dir).map_err(|err| Error::io(dir, err))?;
-    let mut owned = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|err| Error::io(dir, err))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            return Err(Error::Corrupt {
-                path: entry.path(),
-                detail: "file name is not valid UTF-8".to_owned(),
-            });
-        };
-        if name.starts_with('.') {
-            continue;
-        }
-        owned.push((name, entry.path()));
-    }
-    owned.sort();
-    Ok(owned)
-}
-
 /// Whether a directory holds a record.
 ///
 /// A missing directory holds nothing. A real directory with a regular
@@ -422,7 +371,7 @@ fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>,
 /// not a regular file is a foreign entry: it is reported rather than read as an
 /// absent record, so a damaged tree cannot answer "no such session".
 fn holds_record(dir: &Path) -> Result<bool, Error> {
-    if !ancestors_are_real(dir)? {
+    if !sparse::ancestors_are_real(dir)? {
         return Ok(false);
     }
     match fs::symlink_metadata(dir) {
@@ -449,148 +398,10 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
     }
 }
 
-/// Whether the two directories directly above a record are real directories.
-///
-/// `Ok(false)` means one of them is absent, so the record it would hold is
-/// absent too. A file or a symlink in their place is a foreign entry: it is
-/// reported rather than followed, so a link planted above a record cannot make
-/// a write land outside the store.
-fn ancestors_are_real(dir: &Path) -> Result<bool, Error> {
-    for ancestor in dir.ancestors().skip(1).take(2) {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(Error::Corrupt {
-                    path: ancestor.to_path_buf(),
-                    detail: "a store directory must be a real directory".to_owned(),
-                });
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(err) => return Err(Error::io(ancestor, err)),
-        }
-    }
-    Ok(true)
-}
-
-/// Report a path that must be a real directory, like a session's `flags/`.
-fn require_directory(path: &Path) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
-    if metadata.is_dir() {
-        return Ok(());
-    }
-    Err(Error::Corrupt {
-        path: path.to_path_buf(),
-        detail: "a store directory must be a real directory".to_owned(),
-    })
-}
-
-/// Create a directory the store owns, or report a foreign entry in its place.
-///
-/// `create_dir` does not follow a link at the final component, so an existing
-/// link fails with `AlreadyExists` and is checked rather than used.
-fn ensure_directory(path: &Path) -> Result<(), Error> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_directory(path),
-        Err(err) => Err(Error::io(path, err)),
-    }
-}
-
-/// Create a fresh record directory, which must not already exist.
-///
-/// A shard directory may be shared by many records, so it is created tolerantly;
-/// a record directory belongs to one id, and reusing the name would overwrite
-/// the record already there.
-fn create_record_dir(path: &Path) -> Result<(), Error> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(Error::io(
-            path,
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "an object name already holds a record",
-            ),
-        )),
-        Err(err) => Err(Error::io(path, err)),
-    }
-}
-
-/// Report a record file that is not a regular file of its own.
-///
-/// A link at `meta.json` or `hits.log` — a symlink, or a file with more than one
-/// hard link — would let a read or an append land somewhere else in the
-/// filesystem.
-fn require_regular_file(path: &Path) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
-    if !metadata.is_file() {
-        return Err(Error::Corrupt {
-            path: path.to_path_buf(),
-            detail: "a record file must be a regular file".to_owned(),
-        });
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        if metadata.nlink() > 1 {
-            return Err(Error::Corrupt {
-                path: path.to_path_buf(),
-                detail: "a record file must not be linked to another file".to_owned(),
-            });
-        }
-    }
-    Ok(())
-}
-
 /// A report's order: by instant, then by counter, and where both are equal the
 /// object name settles it, so a report reads the same way every time.
 fn compare_status(left: &FlagStatus, right: &FlagStatus) -> std::cmp::Ordering {
     (left.created, left.counter, &left.id).cmp(&(right.created, right.counter, &right.id))
-}
-
-/// Report a shard directory whose name is not exactly two lowercase-hex
-/// characters.
-///
-/// A shard is checked before its contents, so a foreign shard is reported even
-/// when it is empty and no object name is ever reassembled from it.
-fn require_shard(shard: &str, path: &Path) -> Result<(), Error> {
-    if shard.len() == SHARD_LEN && is_lowercase_hex(shard) {
-        return Ok(());
-    }
-    Err(Error::Corrupt {
-        path: path.to_path_buf(),
-        detail: format!("`{shard}` is not a {SHARD_LEN}-character lowercase hex object name"),
-    })
-}
-
-/// Reassemble the object name a sparse directory pair spells out.
-///
-/// The layout is exactly two lowercase-hex characters over the remaining 38.
-/// Any other split or case is a foreign entry rather than a second spelling of
-/// an id that is already stored, and is reported as such.
-fn sparse_id(shard: &str, rest: &str, path: &Path) -> Result<Id, Error> {
-    let canonical = shard.len() == SHARD_LEN
-        && rest.len() == HEX_LEN - SHARD_LEN
-        && is_lowercase_hex(shard)
-        && is_lowercase_hex(rest);
-    if !canonical {
-        return Err(Error::Corrupt {
-            path: path.to_path_buf(),
-            detail: format!(
-                "`{shard}/{rest}` is not a {SHARD_LEN}/{}-character lowercase hex object name",
-                HEX_LEN - SHARD_LEN
-            ),
-        });
-    }
-    Id::parse(&format!("{shard}{rest}")).map_err(|_| Error::Corrupt {
-        path: path.to_path_buf(),
-        detail: format!("`{shard}/{rest}` is not an object name"),
-    })
-}
-
-fn is_lowercase_hex(text: &str) -> bool {
-    text.bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn meta_path(dir: &Path) -> PathBuf {
@@ -617,7 +428,7 @@ fn new_session_meta(desc: &str) -> SessionMeta {
 }
 
 fn read_record<T: DeserializeOwned>(path: &Path) -> Result<T, Error> {
-    require_regular_file(path)?;
+    sparse::require_regular_file(path)?;
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
     serde_json::from_str(&text).map_err(|err| Error::Corrupt {
         path: path.to_path_buf(),
@@ -650,7 +461,7 @@ fn write_record<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
 /// a complete JSON object followed by a newline, so anything else is reported
 /// rather than counted or skipped.
 fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
-    require_regular_file(path)?;
+    sparse::require_regular_file(path)?;
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
     if !text.is_empty() && !text.ends_with('\n') {
         return Err(Error::Corrupt {
@@ -674,7 +485,7 @@ fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
 /// `O_APPEND` makes the offset update and that write atomic, so two concurrent
 /// verifications cannot interleave halves of a line.
 fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
-    require_regular_file(path)?;
+    sparse::require_regular_file(path)?;
     let mut line = serde_json::to_string(hit).map_err(|err| Error::Corrupt {
         path: path.to_path_buf(),
         detail: err.to_string(),
@@ -699,72 +510,6 @@ fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_record_directory_is_never_reused() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("ab").join("rest");
-        fs::create_dir_all(path.parent().expect("parent")).expect("create");
-        create_record_dir(&path).expect("the first record takes the name");
-
-        assert!(
-            matches!(create_record_dir(&path), Err(Error::Io { .. })),
-            "a name that already holds a record is not reused"
-        );
-    }
-
-    #[test]
-    fn a_record_file_is_never_written_through_a_foreign_entry() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("meta.json");
-        fs::create_dir(&path).expect("put a directory where meta.json belongs");
-
-        assert!(matches!(
-            write_record(&path, &1u64),
-            Err(Error::Corrupt { .. })
-        ));
-    }
-
-    #[test]
-    fn a_shard_is_exactly_two_lowercase_hex_characters() {
-        let path = Path::new("shard");
-        for good in ["00", "09", "ab", "ff"] {
-            assert!(require_shard(good, path).is_ok(), "{good}");
-        }
-        for bad in ["", "0", "abc", "AB", "zz", "aG", "a0b"] {
-            assert!(
-                matches!(require_shard(bad, path), Err(Error::Corrupt { .. })),
-                "{bad}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_rest_is_exactly_thirty_eight_lowercase_hex_characters() {
-        let path = Path::new("rest");
-        let flat = "0".repeat(HEX_LEN - SHARD_LEN);
-        assert!(sparse_id("ab", &flat, path).is_ok());
-
-        let mut upper = flat.clone();
-        upper.replace_range(37..38, "A");
-        assert!(matches!(
-            sparse_id("ab", &upper, path),
-            Err(Error::Corrupt { .. })
-        ));
-
-        for length in [0, 1, HEX_LEN - SHARD_LEN - 1, HEX_LEN - SHARD_LEN + 1] {
-            let short = "0".repeat(length);
-            assert!(
-                matches!(sparse_id("ab", &short, path), Err(Error::Corrupt { .. })),
-                "{length}"
-            );
-        }
-
-        assert!(matches!(
-            sparse_id("ab", &"z".repeat(HEX_LEN - SHARD_LEN), path),
-            Err(Error::Corrupt { .. })
-        ));
-    }
 
     fn status_at(created: i64, counter: u64, id: &str) -> FlagStatus {
         FlagStatus {
@@ -804,6 +549,18 @@ mod tests {
             Ordering::Less,
             "the object name settles what is still equal"
         );
+    }
+
+    #[test]
+    fn a_record_file_is_never_written_through_a_foreign_entry() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("meta.json");
+        fs::create_dir(&path).expect("put a directory where meta.json belongs");
+
+        assert!(matches!(
+            write_record(&path, &1u64),
+            Err(Error::Corrupt { .. })
+        ));
     }
 
     #[test]

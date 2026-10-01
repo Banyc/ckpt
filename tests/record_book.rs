@@ -31,16 +31,13 @@ fn verify_at(store: &Store, flag: &FlagId, second: i64) -> u64 {
 }
 
 fn session_dir(root: &Path, session: &SessionId) -> PathBuf {
-    let (shard, rest) = session.as_id().sparse();
-    root.join("sessions").join(shard).join(rest)
+    root.join("sessions").join(session.sparse_path())
 }
 
 fn flag_dir(root: &Path, session: &SessionId, flag: &FlagId) -> PathBuf {
-    let (shard, rest) = flag.as_id().sparse();
     session_dir(root, session)
         .join("flags")
-        .join(shard)
-        .join(rest)
+        .join(flag.sparse_path())
 }
 
 #[test]
@@ -48,8 +45,10 @@ fn a_session_lands_in_the_sparse_tree() {
     let (dir, store) = book();
     let session = store.session_new("perf plots").expect("session");
 
-    let (shard, rest) = session.as_id().sparse();
-    assert_eq!(shard.len(), 2);
+    let path = session.sparse_path();
+    let shard = path.parent().expect("shard");
+    let rest = path.file_name().expect("rest");
+    assert_eq!(shard.as_os_str().len(), 2);
     assert_eq!(rest.len(), 38);
 
     let session_dir = session_dir(dir.path(), &session);
@@ -242,20 +241,29 @@ fn ids_accept_flat_sparse_and_uppercase_forms() {
     let flat = "0123456789abcdef0123456789abcdef01234567";
     let sparse = format!("{}/{}", &flat[..2], &flat[2..]);
 
-    assert_eq!(Id::parse(flat).expect("flat").as_str(), flat);
-    assert_eq!(Id::parse(&sparse).expect("sparse").as_str(), flat);
+    // The typed ids are what a command line parses; the bare object name is
+    // flat only.
+    assert_eq!(SessionId::parse(flat).expect("flat").as_id().as_str(), flat);
     assert_eq!(
-        Id::parse(&flat.to_uppercase()).expect("uppercase").as_str(),
+        SessionId::parse(&sparse).expect("sparse").as_id().as_str(),
+        flat
+    );
+    assert_eq!(
+        SessionId::parse(&flat.to_uppercase())
+            .expect("uppercase")
+            .as_id()
+            .as_str(),
         flat,
         "object names are stored lowercased"
     );
     assert_eq!(
-        Id::parse(&format!(
+        SessionId::parse(&format!(
             "{}/{}",
             flat[..2].to_uppercase(),
             flat[2..].to_uppercase()
         ))
         .expect("uppercase sparse")
+        .as_id()
         .as_str(),
         flat,
         "a sparse argument is normalized like a flat one"
@@ -269,9 +277,11 @@ fn dotfiles_in_owned_directories_are_ignored() {
     let flag = store.flag_new(&session, "flag").expect("flag");
     verify_at(&store, &flag, 1_000);
 
-    let (shard, _) = session.as_id().sparse();
     fs::write(
-        dir.path().join("sessions").join(shard).join(".DS_Store"),
+        session_dir(dir.path(), &session)
+            .parent()
+            .expect("shard")
+            .join(".DS_Store"),
         "junk",
     )
     .expect("write dotfile");
@@ -289,8 +299,13 @@ fn dotfiles_in_owned_directories_are_ignored() {
 fn a_foreign_entry_in_an_owned_directory_is_reported() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
-    let (shard, _) = session.as_id().sparse();
-    fs::create_dir(dir.path().join("sessions").join(shard).join("not-an-id")).expect("create");
+    fs::create_dir(
+        session_dir(dir.path(), &session)
+            .parent()
+            .expect("shard")
+            .join("not-an-id"),
+    )
+    .expect("create");
 
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }
@@ -959,7 +974,8 @@ fn a_symlinked_flag_shard_on_the_read_path_is_reported() {
         store.verify(&flag, &Verify::new()),
         Err(Error::Corrupt { .. })
     ));
-    let log = moved.join(flag.as_id().sparse().1).join("hits.log");
+    let rest = flag.sparse_path();
+    let log = moved.join(rest.file_name().expect("rest")).join("hits.log");
     assert_eq!(
         fs::read_to_string(log).expect("read log").lines().count(),
         1,

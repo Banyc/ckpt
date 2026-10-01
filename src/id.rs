@@ -6,7 +6,7 @@
 //! entries, and the filesystem tree is the index.
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use serde::Serialize;
@@ -15,9 +15,6 @@ use crate::Error;
 
 /// The number of hex characters in an object name.
 pub const HEX_LEN: usize = 40;
-
-/// The number of leading characters that name the first sparse path component.
-pub const SHARD_LEN: usize = 2;
 
 const ID_BYTES: usize = HEX_LEN / 2;
 const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -39,41 +36,19 @@ impl Id {
         Id(hex(&bytes))
     }
 
-    /// Parse a 40-character hex object name, flat or in sparse `ab/rest` form.
+    /// Parse a 40-character lowercase hex object name.
     pub fn parse(input: &str) -> Result<Id, Error> {
-        let flat = match input.split_once('/') {
-            None => input.to_owned(),
-            Some((shard, rest)) if shard.len() == SHARD_LEN && !rest.contains('/') => {
-                format!("{shard}{rest}")
-            }
-            Some(_) => {
-                return Err(Error::InvalidId {
-                    input: input.to_owned(),
-                });
-            }
-        };
-        if flat.len() != HEX_LEN || !flat.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if input.len() != HEX_LEN || !input.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(Error::InvalidId {
                 input: input.to_owned(),
             });
         }
-        Ok(Id(flat.to_ascii_lowercase()))
+        Ok(Id(input.to_ascii_lowercase()))
     }
 
     /// The flat 40-character form.
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-
-    /// The two path components of the sparse layout.
-    pub fn sparse(&self) -> (&str, &str) {
-        self.0.split_at(SHARD_LEN)
-    }
-
-    /// The sparse layout as a relative path.
-    pub fn sparse_path(&self) -> PathBuf {
-        let (shard, rest) = self.sparse();
-        Path::new(shard).join(rest)
     }
 }
 
@@ -119,9 +94,9 @@ macro_rules! object_id {
                 $name(Id::generate())
             }
 
-            /// Parse a 40-character hex object name, flat or in sparse form.
+            /// Parse an object name, flat or in sparse `ab/rest` form.
             pub fn parse(input: &str) -> Result<$name, Error> {
-                Ok($name(Id::parse(input)?))
+                Ok($name(crate::sparse::parse_id(input)?))
             }
 
             /// Wrap an already-validated object name.
@@ -136,7 +111,7 @@ macro_rules! object_id {
 
             /// The sparse layout as a relative path.
             pub fn sparse_path(&self) -> PathBuf {
-                self.0.sparse_path()
+                crate::sparse::path(&self.0)
             }
         }
 

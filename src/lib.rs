@@ -20,6 +20,7 @@
 mod error;
 mod id;
 mod record;
+mod sparse;
 mod store;
 
 pub use error::Error;
