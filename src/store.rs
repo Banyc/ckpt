@@ -10,11 +10,12 @@
 //! own `meta.json` is. A `hits.log` holds one JSON line per verification, so a
 //! count is a line count and an append is a single atomic write.
 //!
-//! Every path the store would have written itself is checked for what it is:
-//! a missing record is absent, a real directory with a regular `meta.json` is a
-//! record, and anything else — a file, a symlink, a `meta.json` that is not a
-//! regular file — is reported as a foreign entry rather than read as an absent
-//! record.
+//! Every level the store owns is checked for what it is before it is used: the
+//! `sessions` directory, each shard, each record directory, and the record files
+//! themselves. A missing record is absent, a real directory with a regular
+//! `meta.json` is a record, and anything else — a file, a symlink, or a
+//! `meta.json` that is not a regular file — is reported as a foreign entry
+//! rather than read or written through.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -78,11 +79,19 @@ impl Store {
     }
 
     /// Create a session and return its id.
+    ///
+    /// The root itself is created as needed and may be a link the caller chose;
+    /// every directory below it is created one level at a time so a link
+    /// planted above a record is reported instead of followed.
     pub fn session_new(&self, desc: &str) -> Result<SessionId, Error> {
         let session = SessionId::generate();
-        let flags = self.flags_dir(&session);
-        fs::create_dir_all(&flags).map_err(|err| Error::io(&flags, err))?;
-        write_meta(&self.session_dir(&session), desc)?;
+        fs::create_dir_all(&self.root).map_err(|err| Error::io(&self.root, err))?;
+        ensure_directory(&self.sessions_dir())?;
+        ensure_directory(&self.session_shard_dir(&session))?;
+        let dir = self.session_dir(&session);
+        ensure_directory(&dir)?;
+        ensure_directory(&self.flags_dir(&session))?;
+        write_meta(&dir, desc)?;
         Ok(session)
     }
 
@@ -105,7 +114,8 @@ impl Store {
 
         let flag = FlagId::generate();
         let flag_dir = self.flag_dir(session, &flag);
-        fs::create_dir_all(&flag_dir).map_err(|err| Error::io(&flag_dir, err))?;
+        ensure_directory(&self.flag_shard_dir(session, &flag))?;
+        ensure_directory(&flag_dir)?;
         let hits = hits_path(&flag_dir);
         File::create(&hits).map_err(|err| Error::io(&hits, err))?;
         write_meta(&flag_dir, desc)?;
@@ -186,12 +196,20 @@ impl Store {
         self.root.join("sessions")
     }
 
+    fn session_shard_dir(&self, session: &SessionId) -> PathBuf {
+        self.sessions_dir().join(session.as_id().sparse().0)
+    }
+
     fn session_dir(&self, session: &SessionId) -> PathBuf {
         self.sessions_dir().join(session.sparse_path())
     }
 
     fn flags_dir(&self, session: &SessionId) -> PathBuf {
         self.session_dir(session).join("flags")
+    }
+
+    fn flag_shard_dir(&self, session: &SessionId, flag: &FlagId) -> PathBuf {
+        self.flags_dir(session).join(flag.as_id().sparse().0)
     }
 
     fn flag_dir(&self, session: &SessionId, flag: &FlagId) -> PathBuf {
@@ -340,11 +358,14 @@ fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>,
 /// Whether a directory holds a record.
 ///
 /// A missing directory holds nothing, and a real directory with a regular
-/// `meta.json` holds one. A file or symlink at the object name, or a
-/// `meta.json` that is not a regular file, is a foreign entry: it is reported
-/// rather than read as an absent record, so a damaged tree cannot answer "no
-/// such session".
+/// `meta.json` holds one. A file or symlink at the object name, a shard above it
+/// that is not a real directory, or a `meta.json` that is not a regular file is
+/// a foreign entry: it is reported rather than read as an absent record, so a
+/// damaged tree cannot answer "no such session".
 fn holds_record(dir: &Path) -> Result<bool, Error> {
+    if !ancestors_are_real(dir)? {
+        return Ok(false);
+    }
     match fs::symlink_metadata(dir) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(Error::io(dir, err)),
@@ -369,6 +390,29 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
     }
 }
 
+/// Whether the two directories directly above a record are real directories.
+///
+/// `Ok(false)` means one of them is absent, so the record it would hold is
+/// absent too. A file or a symlink in their place is a foreign entry: it is
+/// reported rather than followed, so a link planted above a record cannot make
+/// a write land outside the store.
+fn ancestors_are_real(dir: &Path) -> Result<bool, Error> {
+    for ancestor in dir.ancestors().skip(1).take(2) {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(Error::Corrupt {
+                    path: ancestor.to_path_buf(),
+                    detail: "a store directory must be a real directory".to_owned(),
+                });
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(Error::io(ancestor, err)),
+        }
+    }
+    Ok(true)
+}
+
 /// Report a path that must be a real directory, like a session's `flags/`.
 fn require_directory(path: &Path) -> Result<(), Error> {
     let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
@@ -379,6 +423,33 @@ fn require_directory(path: &Path) -> Result<(), Error> {
         path: path.to_path_buf(),
         detail: "a store directory must be a real directory".to_owned(),
     })
+}
+
+/// Create a directory the store owns, or report a foreign entry in its place.
+///
+/// `create_dir` does not follow a link at the final component, so an existing
+/// link fails with `AlreadyExists` and is checked rather than used.
+fn ensure_directory(path: &Path) -> Result<(), Error> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_directory(path),
+        Err(err) => Err(Error::io(path, err)),
+    }
+}
+
+/// Report a record file that is not a regular file.
+///
+/// A link at `meta.json` or `hits.log` would let a read or an append land
+/// somewhere else in the filesystem.
+fn require_regular_file(path: &Path) -> Result<(), Error> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: "a record file must be a regular file".to_owned(),
+        }),
+        Err(err) => Err(Error::io(path, err)),
+    }
 }
 
 /// Report a shard directory whose name is not exactly two lowercase-hex
@@ -436,6 +507,7 @@ fn hits_path(dir: &Path) -> PathBuf {
 
 fn read_meta(dir: &Path) -> Result<Meta, Error> {
     let path = meta_path(dir);
+    require_regular_file(&path)?;
     let text = fs::read_to_string(&path).map_err(|err| Error::io(&path, err))?;
     serde_json::from_str(&text).map_err(|err| Error::Corrupt {
         path,
@@ -445,6 +517,17 @@ fn read_meta(dir: &Path) -> Result<Meta, Error> {
 
 fn write_meta(dir: &Path, desc: &str) -> Result<(), Error> {
     let path = meta_path(dir);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => {
+            return Err(Error::Corrupt {
+                path,
+                detail: "a record file must be a regular file".to_owned(),
+            });
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(Error::io(&path, err)),
+    }
     let meta = Meta {
         desc: desc.to_owned(),
         created: Timestamp::now(),
@@ -468,6 +551,7 @@ struct Hits {
 /// writer only ever appends a complete JSON object, so anything else is
 /// reported rather than counted or skipped.
 fn read_hits(path: &Path) -> Result<Hits, Error> {
+    require_regular_file(path)?;
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
     let entries = text
         .lines()
@@ -492,6 +576,7 @@ fn read_hits(path: &Path) -> Result<Hits, Error> {
 /// never terminated gets its separator in the same buffer, so the append cannot
 /// merge into the record already there.
 fn append_hit(path: &Path, hit: &Hit, terminated: bool) -> Result<(), Error> {
+    require_regular_file(path)?;
     let mut line = String::new();
     if !terminated {
         line.push('\n');

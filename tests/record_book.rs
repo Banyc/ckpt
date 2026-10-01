@@ -89,7 +89,7 @@ fn a_flag_lands_in_the_sparse_tree_with_an_empty_log() {
 
 #[test]
 fn verify_counts_each_hit() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     let session = store.session_new("session").expect("session");
     let flag = store.flag_new(&session, "flag").expect("flag");
 
@@ -105,7 +105,7 @@ fn verify_counts_each_hit() {
 
 #[test]
 fn hits_are_counted_per_flag() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     let session = store.session_new("session").expect("session");
     let first = store.flag_new(&session, "first").expect("flag");
     let second = store.flag_new(&session, "second").expect("flag");
@@ -129,7 +129,7 @@ fn hits_are_counted_per_flag() {
 
 #[test]
 fn a_flag_id_names_the_session_that_holds_it() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     let first = store.session_new("first session").expect("session");
     let second = store.session_new("second session").expect("session");
     let flag = store.flag_new(&second, "flag").expect("flag");
@@ -196,7 +196,7 @@ fn hits_are_written_as_rfc3339() {
 
 #[test]
 fn unknown_ids_are_not_found() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     assert!(store.sessions().expect("sessions").is_empty());
 
     let absent_session = SessionId::generate();
@@ -308,7 +308,7 @@ fn a_damaged_record_is_reported() {
 
 #[test]
 fn sessions_are_listed_with_their_totals() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     let first = store.session_new("first").expect("session");
     let second = store.session_new("second").expect("session");
     let first_flag = store.flag_new(&first, "a").expect("flag");
@@ -445,7 +445,7 @@ fn a_failed_verification_writes_nothing() {
 #[test]
 fn descriptions_round_trip() {
     for desc in ["", "unicode: σ 性能", &"x".repeat(4096)] {
-        let (_, store) = book();
+        let (_dir, store) = book();
         let session = store.session_new(desc).expect("session");
         store.flag_new(&session, desc).expect("flag");
 
@@ -520,7 +520,7 @@ fn a_flag_under_a_session_without_meta_is_not_found() {
 
 #[test]
 fn a_flag_lookup_counts_only_its_own_session() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     let first = store.session_new("first").expect("session");
     let second = store.session_new("second").expect("session");
     let first_flag = store.flag_new(&first, "a").expect("flag");
@@ -718,7 +718,7 @@ fn a_foreign_entry_in_a_flag_shard_is_reported() {
 
 #[test]
 fn the_last_hit_is_the_last_appended() {
-    let (_, store) = book();
+    let (_dir, store) = book();
     let session = store.session_new("session").expect("session");
     let flag = store.flag_new(&session, "flag").expect("flag");
 
@@ -826,6 +826,7 @@ fn an_empty_foreign_flag_shard_is_reported() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_flag_is_not_added_to_a_corrupt_session() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
@@ -839,4 +840,103 @@ fn a_flag_is_not_added_to_a_corrupt_session() {
         store.flag_new(&session, "flag"),
         Err(Error::Corrupt { .. })
     ));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_shard_is_not_written_through() {
+    let (dir, store) = book();
+    let outside = TempDir::new().expect("temp dir");
+    let sessions = dir.path().join("sessions");
+    fs::create_dir_all(&sessions).expect("create");
+    for high in "0123456789abcdef".chars() {
+        for low in "0123456789abcdef".chars() {
+            std::os::unix::fs::symlink(outside.path(), sessions.join(format!("{high}{low}")))
+                .expect("symlink a shard");
+        }
+    }
+
+    assert!(
+        matches!(store.session_new("session"), Err(Error::Corrupt { .. })),
+        "a link where a shard belongs is reported, not followed"
+    );
+    assert!(
+        outside.path().read_dir().expect("read").next().is_none(),
+        "nothing was created outside the store"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_flag_shard_is_not_written_through() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let outside = TempDir::new().expect("temp dir");
+    let flags = session_dir(dir.path(), &session).join("flags");
+    for high in "0123456789abcdef".chars() {
+        for low in "0123456789abcdef".chars() {
+            std::os::unix::fs::symlink(outside.path(), flags.join(format!("{high}{low}")))
+                .expect("symlink a shard");
+        }
+    }
+
+    assert!(
+        matches!(store.flag_new(&session, "flag"), Err(Error::Corrupt { .. })),
+        "a link where a flag shard belongs is reported, not followed"
+    );
+    assert!(
+        outside.path().read_dir().expect("read").next().is_none(),
+        "nothing was created outside the store"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_hit_log_is_not_written_through() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let outside = TempDir::new().expect("temp dir");
+    let target = outside.path().join("elsewhere.log");
+    // A parseable line, so only the link check stops the append.
+    fs::write(&target, "{\"ts\":\"2030-01-01T00:00:00Z\"}\n").expect("write target");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::remove_file(&log).expect("remove log");
+    std::os::unix::fs::symlink(&target, &log).expect("symlink");
+
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&target).expect("read target"),
+        "{\"ts\":\"2030-01-01T00:00:00Z\"}\n",
+        "the file outside the store is untouched"
+    );
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_meta_is_not_read_through() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let outside = TempDir::new().expect("temp dir");
+    let target = outside.path().join("elsewhere.json");
+    fs::write(
+        &target,
+        "{\"desc\":\"borrowed\",\"created\":\"2030-01-01T00:00:00Z\"}\n",
+    )
+    .expect("write target");
+    let meta = session_dir(dir.path(), &session).join("meta.json");
+    fs::remove_file(&meta).expect("remove meta");
+    std::os::unix::fs::symlink(&target, &meta).expect("symlink");
+
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "a borrowed record is refused"
+    );
 }
