@@ -535,3 +535,238 @@ fn a_flag_lookup_counts_only_its_own_session() {
     assert_eq!(status.flags[0].id, second_flag);
     assert_eq!(status.flags[0].hits, 1);
 }
+
+fn copy_tree(from: &Path, to: &Path) {
+    fs::create_dir_all(to).expect("create");
+    for entry in fs::read_dir(from).expect("read") {
+        let entry = entry.expect("entry");
+        let target = to.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).expect("copy file");
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlink_at_a_store_directory_is_reported() {
+    let (dir, store) = book();
+    let outside = TempDir::new().expect("temp dir");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("sessions")).expect("symlink");
+
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "a symlink where the store keeps sessions is a foreign entry"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_dangling_symlink_at_a_store_directory_is_reported() {
+    let (dir, store) = book();
+    std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("sessions"))
+        .expect("symlink");
+
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "a link to nothing is not an empty store"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlink_at_a_flag_object_name_is_not_written_through() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let outside = TempDir::new().expect("temp dir");
+    let moved = outside.path().join("moved");
+    let link = flag_dir(dir.path(), &session, &flag);
+    fs::rename(&link, &moved).expect("move the record out of the tree");
+    std::os::unix::fs::symlink(&moved, &link).expect("symlink");
+
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(moved.join("hits.log")).expect("read log"),
+        "",
+        "a hit is never written through a link"
+    );
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_file_at_a_flag_object_name_is_reported_by_the_flag_path() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let stray = session_dir(dir.path(), &session)
+        .join("flags")
+        .join("ab")
+        .join("0".repeat(38));
+    fs::create_dir_all(stray.parent().expect("parent")).expect("create");
+    fs::write(&stray, "not a record").expect("write stray");
+
+    let id = FlagId::parse(&format!("ab{}", "0".repeat(38))).expect("id");
+    assert!(
+        matches!(store.status(id.as_id()), Err(Error::Corrupt { .. })),
+        "the flag path reports what the session path reports"
+    );
+    assert!(matches!(
+        store.verify(&id, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_meta_that_is_not_a_regular_file_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let meta = session_dir(dir.path(), &session).join("meta.json");
+    fs::remove_file(&meta).expect("remove meta");
+    fs::create_dir(&meta).expect("put a directory at meta.json");
+
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_write_does_not_heal_a_missing_flag_directory() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flags = session_dir(dir.path(), &session).join("flags");
+    fs::remove_dir_all(&flags).expect("remove flags");
+
+    assert!(matches!(
+        store.flag_new(&session, "flag"),
+        Err(Error::Io { .. })
+    ));
+    assert!(!flags.exists(), "nothing was recreated");
+}
+
+#[test]
+fn a_damaged_log_is_reported_without_appending() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::write(&log, "damaged\n").expect("damage the log");
+
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read log"),
+        "damaged\n",
+        "a rejected verification leaves the log untouched"
+    );
+}
+
+#[test]
+fn a_flag_recorded_under_two_sessions_is_reported() {
+    let (dir, store) = book();
+    let first = store.session_new("first").expect("session");
+    let second = store.session_new("second").expect("session");
+    let flag = store.flag_new(&first, "flag").expect("flag");
+
+    let from = flag_dir(dir.path(), &first, &flag);
+    let to = flag_dir(dir.path(), &second, &flag);
+    fs::create_dir_all(to.parent().expect("parent")).expect("create");
+    copy_tree(&from, &to);
+
+    assert!(
+        matches!(
+            store.verify(&flag, &Verify::new()),
+            Err(Error::Corrupt { .. })
+        ),
+        "a hit must not land in whichever session the walk reached first"
+    );
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_foreign_entry_in_a_flag_shard_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    store.flag_new(&session, "flag").expect("flag");
+    let shard = session_dir(dir.path(), &session).join("flags").join("ab");
+    fs::create_dir_all(&shard).expect("create");
+    fs::create_dir(shard.join("not-an-id")).expect("create foreign entry");
+
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn the_last_hit_is_the_last_appended() {
+    let (_, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    assert_eq!(
+        store.status(flag.as_id()).expect("status").flags[0].last_hit,
+        None,
+        "a flag with no hits has no last hit"
+    );
+
+    verify_at(&store, &flag, 2_000);
+    verify_at(&store, &flag, 1_000);
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.flags[0].hits, 2);
+    assert_eq!(
+        status.flags[0].last_hit,
+        at(1_000),
+        "the log's order decides, not the largest instant"
+    );
+}
+
+#[test]
+// macOS rejects a non-UTF-8 file name at the syscall, so an entry this branch
+// guards against cannot be created there. Linux filesystems store such names.
+#[cfg(target_os = "linux")]
+fn a_non_utf8_entry_name_is_reported() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let (dir, store) = book();
+    let shard = dir.path().join("sessions").join("ab");
+    fs::create_dir_all(&shard).expect("create");
+    fs::create_dir(shard.join(std::ffi::OsStr::from_bytes(b"\xff\xfe"))).expect("create odd name");
+
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_final_line_without_a_newline_is_read() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        flag_dir(dir.path(), &session, &flag).join("hits.log"),
+        "{\"ts\":\"2030-01-01T00:00:00Z\"}",
+    )
+    .expect("write a line without a newline");
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.flags[0].hits, 1);
+    assert_eq!(status.flags[0].last_hit, at(1_893_456_000));
+}

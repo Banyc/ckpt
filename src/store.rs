@@ -9,6 +9,12 @@
 //! A session exists once its `meta.json` is there; a ctf flag exists once its
 //! own `meta.json` is. A `hits.log` holds one JSON line per verification, so a
 //! count is a line count and an append is a single atomic write.
+//!
+//! Every path the store would have written itself is checked for what it is:
+//! a missing record is absent, a real directory with a regular `meta.json` is a
+//! record, and anything else — a file, a symlink, a `meta.json` that is not a
+//! regular file — is reported as a foreign entry rather than read as an absent
+//! record.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -83,12 +89,17 @@ impl Store {
     /// Add a ctf flag to `session` and return its id.
     pub fn flag_new(&self, session: &SessionId, desc: &str) -> Result<FlagId, Error> {
         let dir = self.session_dir(session);
-        if !meta_path(&dir).is_file() {
+        if !holds_record(&dir)? {
             return Err(Error::NotFound {
                 kind: "session",
                 id: session.to_string(),
             });
         }
+        // The `flags/` entry belongs to the session. A missing or foreign one
+        // is reported rather than created here, so a write never heals a
+        // damaged tree behind the read paths' back.
+        require_directory(&self.flags_dir(session))?;
+
         let flag = FlagId::generate();
         let flag_dir = self.flag_dir(session, &flag);
         fs::create_dir_all(&flag_dir).map_err(|err| Error::io(&flag_dir, err))?;
@@ -98,25 +109,42 @@ impl Store {
         Ok(flag)
     }
 
-    /// Append one verification hit for `flag` and return the flag's fresh status.
+    /// Append one verification hit for `flag` and report its fresh count.
+    ///
+    /// An `Ok` result means exactly one hit was appended. An error means the
+    /// record was rejected before anything was written, so a caller may retry
+    /// without double-counting.
     pub fn verify(&self, flag: &FlagId, settings: &Verify) -> Result<FlagStatus, Error> {
         let session = self.flag_owner(flag)?.ok_or_else(|| Error::NotFound {
             kind: "flag",
             id: flag.to_string(),
         })?;
+        let dir = self.flag_dir(&session, flag);
+
+        // Read before writing: a damaged log is reported without a hit having
+        // been appended.
+        let meta = read_meta(&dir)?;
+        let hits = read_hits(&hits_path(&dir))?.len() as u64 + 1;
         let hit = Hit {
             ts: settings.at.unwrap_or_else(Timestamp::now),
             note: settings.note.clone(),
         };
-        append_hit(&hits_path(&self.flag_dir(&session, flag)), &hit)?;
-        self.flag_status(&session, flag)
+        append_hit(&hits_path(&dir), &hit)?;
+
+        Ok(FlagStatus {
+            id: flag.clone(),
+            desc: meta.desc,
+            created: meta.created,
+            hits,
+            last_hit: Some(hit.ts),
+        })
     }
 
     /// The status of the session `id` names, where `id` may be a session id or
     /// the id of any of that session's ctf flags.
     pub fn status(&self, id: &Id) -> Result<Status, Error> {
         let session = SessionId::from_id(id.clone());
-        if meta_path(&self.session_dir(&session)).is_file() {
+        if holds_record(&self.session_dir(&session))? {
             return self.session_status(&session, Target::Session);
         }
         let flag = FlagId::from_id(id.clone());
@@ -165,8 +193,7 @@ impl Store {
         for (shard, shard_path) in owned_entries(&self.sessions_dir(), Missing::Empty)? {
             for (rest, rest_path) in owned_entries(&shard_path, Missing::Empty)? {
                 let session = SessionId::from_id(sparse_id(&shard, &rest, &rest_path)?);
-                require_directory(&rest_path)?;
-                if meta_path(&rest_path).is_file() {
+                if holds_record(&rest_path)? {
                     ids.push(session);
                 }
             }
@@ -179,8 +206,7 @@ impl Store {
         for (shard, shard_path) in owned_entries(&self.flags_dir(session), Missing::Error)? {
             for (rest, rest_path) in owned_entries(&shard_path, Missing::Error)? {
                 let flag = FlagId::from_id(sparse_id(&shard, &rest, &rest_path)?);
-                require_directory(&rest_path)?;
-                if meta_path(&rest_path).is_file() {
+                if holds_record(&rest_path)? {
                     ids.push(flag);
                 }
             }
@@ -188,17 +214,29 @@ impl Store {
         Ok(ids)
     }
 
-    /// The session a ctf flag is recorded under.
+    /// The one session a ctf flag is recorded under.
     ///
     /// A flag is stored inside its session, so this walks the `flags/` entry of
-    /// every session: the tree is the index, and nothing is cached.
+    /// every session: the tree is the index, and nothing is cached. The same
+    /// flag id recorded under two sessions is reported rather than resolved to
+    /// one of them, because a hit would otherwise land in whichever the walk
+    /// reached first.
     fn flag_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
+        let mut owner: Option<SessionId> = None;
         for session in self.session_ids()? {
-            if meta_path(&self.flag_dir(&session, flag)).is_file() {
-                return Ok(Some(session));
+            let dir = self.flag_dir(&session, flag);
+            if !holds_record(&dir)? {
+                continue;
             }
+            if owner.is_some() {
+                return Err(Error::Corrupt {
+                    path: dir,
+                    detail: format!("the flag `{flag}` is recorded under two sessions"),
+                });
+            }
+            owner = Some(session);
         }
-        Ok(None)
+        Ok(owner)
     }
 
     fn flag_status(&self, session: &SessionId, flag: &FlagId) -> Result<FlagStatus, Error> {
@@ -247,15 +285,28 @@ enum Missing {
 /// The non-dot entries of a directory the store owns, sorted by name.
 ///
 /// Dotfiles belong to the operating system and are skipped; every other entry
-/// must be an object name.
+/// must be an object name. A path that is not a real directory is a foreign
+/// entry, whether it is a file, a symlink to a directory, or a dangling
+/// symlink.
 fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>, Error> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound && missing == Missing::Empty => {
-            return Ok(Vec::new());
+    match fs::symlink_metadata(dir) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                return Err(Error::Corrupt {
+                    path: dir.to_path_buf(),
+                    detail: "a store directory must be a real directory".to_owned(),
+                });
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if missing == Missing::Empty {
+                return Ok(Vec::new());
+            }
         }
         Err(err) => return Err(Error::io(dir, err)),
-    };
+    }
+
+    let entries = fs::read_dir(dir).map_err(|err| Error::io(dir, err))?;
     let mut owned = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|err| Error::io(dir, err))?;
@@ -272,6 +323,50 @@ fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>,
     }
     owned.sort();
     Ok(owned)
+}
+
+/// Whether a directory holds a record.
+///
+/// A missing directory holds nothing, and a real directory with a regular
+/// `meta.json` holds one. A file or symlink at the object name, or a
+/// `meta.json` that is not a regular file, is a foreign entry: it is reported
+/// rather than read as an absent record, so a damaged tree cannot answer "no
+/// such session".
+fn holds_record(dir: &Path) -> Result<bool, Error> {
+    match fs::symlink_metadata(dir) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::io(dir, err)),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(Error::Corrupt {
+                path: dir.to_path_buf(),
+                detail: "an object name must be a directory".to_owned(),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    let meta = meta_path(dir);
+    match fs::symlink_metadata(&meta) {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(Error::io(&meta, err)),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(Error::Corrupt {
+            path: meta,
+            detail: "meta.json must be a regular file".to_owned(),
+        }),
+    }
+}
+
+/// Report a path that must be a real directory, like a session's `flags/`.
+fn require_directory(path: &Path) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    Err(Error::Corrupt {
+        path: path.to_path_buf(),
+        detail: "a store directory must be a real directory".to_owned(),
+    })
 }
 
 /// Reassemble the object name a sparse directory pair spells out.
@@ -302,22 +397,6 @@ fn sparse_id(shard: &str, rest: &str, path: &Path) -> Result<Id, Error> {
 fn is_lowercase_hex(text: &str) -> bool {
     text.bytes()
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-/// A record at an object name must be a real directory.
-///
-/// A file or a symlink at a name the store would have written itself is a
-/// foreign entry, not an absent record, so it is reported rather than skipped
-/// as "no such session".
-fn require_directory(path: &Path) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
-    if metadata.is_dir() {
-        return Ok(());
-    }
-    Err(Error::Corrupt {
-        path: path.to_path_buf(),
-        detail: "an object name must be a directory".to_owned(),
-    })
 }
 
 fn meta_path(dir: &Path) -> PathBuf {

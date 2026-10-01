@@ -47,7 +47,9 @@ pub struct FlagStatus {
     pub created: Timestamp,
     /// How many verifications have been recorded.
     pub hits: u64,
-    /// When the most recent verification was recorded.
+    /// When the most recent verification was recorded: the last hit appended,
+    /// which is the log's own order. A caller that supplies out-of-order
+    /// instants still sees the one recorded most recently.
     pub last_hit: Option<Timestamp>,
 }
 

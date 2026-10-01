@@ -1,7 +1,8 @@
 //! The command line against the same tree.
 
+use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 fn ckpt(root: &Path, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ckpt"))
@@ -149,5 +150,94 @@ fn an_empty_store_reports_itself() {
             .as_array()
             .expect("array")
             .is_empty()
+    );
+}
+
+#[test]
+fn the_root_flag_wins_over_the_environment() {
+    let from_env = tempfile::tempdir().expect("temp dir");
+    let from_flag = tempfile::tempdir().expect("temp dir");
+    let out = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .env("CKPT_ROOT", from_env.path())
+        .arg("--root")
+        .arg(from_flag.path())
+        .args(["session", "new", "--desc", "s"])
+        .output()
+        .expect("run ckpt");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(from_flag.path().join("sessions").is_dir());
+    assert!(!from_env.path().join("sessions").exists());
+}
+
+#[test]
+fn the_note_is_stored_with_the_hit() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+    let flag = ok(root, &["flag", "new", &session, "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+
+    ok(root, &["verify", &flag, "--note", "saw it in the plot"]);
+
+    let log = root
+        .join("sessions")
+        .join(&session[..2])
+        .join(&session[2..])
+        .join("flags")
+        .join(&flag[..2])
+        .join(&flag[2..])
+        .join("hits.log");
+    let text = fs::read_to_string(log).expect("read hits");
+    assert!(text.contains("saw it in the plot"), "{text}");
+}
+
+#[test]
+fn concurrent_verifications_from_separate_processes_all_land() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+    let flag = ok(root, &["flag", "new", &session, "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+
+    let verifications = 24;
+    let mut children = Vec::new();
+    for _ in 0..verifications {
+        children.push(
+            Command::new(env!("CARGO_BIN_EXE_ckpt"))
+                .arg("--root")
+                .arg(root)
+                .args(["verify", &flag])
+                .stdout(Stdio::null())
+                .spawn()
+                .expect("spawn ckpt"),
+        );
+    }
+    for mut child in children {
+        assert!(child.wait().expect("wait").success());
+    }
+
+    let log = root
+        .join("sessions")
+        .join(&session[..2])
+        .join(&session[2..])
+        .join("flags")
+        .join(&flag[..2])
+        .join(&flag[2..])
+        .join("hits.log");
+    let text = fs::read_to_string(log).expect("read hits");
+    let lines: Vec<&str> = text.lines().filter(|line| !line.is_empty()).collect();
+    assert_eq!(lines.len(), verifications, "one line per verification");
+    assert!(
+        lines
+            .iter()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_ok()),
+        "no line was torn by a concurrent process"
     );
 }
