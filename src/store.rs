@@ -29,13 +29,16 @@
 //! session being reported, or a session the mapping names that does not hold the
 //! flag, is reported rather than followed.
 //!
+//! A record may carry fields this version does not know; they are read past, so
+//! a record written by a newer build stays readable here.
+//!
 //! A record directory is read by name — its `meta.json` and `hits.log` — so
 //! other names inside it are ignored. The checks above are made before a path is
 //! used rather than while it is open: they refuse links and foreign entries left
 //! in the tree, they do not defend against another process swapping one in
 //! mid-operation, because the store belongs to the process reading it.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -145,7 +148,7 @@ impl Store {
         sparse::create_record_dir(&flag_dir)?;
         self.write_owner(session, &flag)?;
         let hits = hits_path(&flag_dir);
-        File::create(&hits).map_err(|err| Error::io(&hits, err))?;
+        sparse::write_new_file(&hits, "")?;
         write_record(
             &meta_path(&flag_dir),
             &FlagMeta {

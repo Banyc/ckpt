@@ -859,13 +859,19 @@ fn a_flag_lookup_reports_a_missing_flag_directory() {
 #[test]
 fn an_interrupted_write_is_invisible() {
     let (dir, store) = book();
-    let session = store.session_new("session").expect("session");
-    let flat = session.as_id().as_str().to_owned();
-    fs::remove_file(session_dir(dir.path(), &session).join("meta.json")).expect("remove meta");
+    let interrupted = store.session_new("session").expect("session");
+    fs::remove_file(session_dir(dir.path(), &interrupted).join("meta.json")).expect("remove meta");
 
     assert!(
         store.sessions().expect("sessions").is_empty(),
         "a directory with no meta.json is an interrupted write, not a record"
+    );
+    assert!(
+        matches!(
+            store.status(interrupted.as_id()),
+            Err(Error::NotFound { .. })
+        ),
+        "and it does not answer as a session either"
     );
 
     // The same at the flag level: hits.log is created before meta.json, so an
@@ -880,7 +886,7 @@ fn an_interrupted_write_is_invisible() {
     );
 
     assert!(
-        !flat.is_empty() && store.status(session.as_id()).is_ok(),
+        store.status(session.as_id()).is_ok(),
         "the store keeps answering for the sessions that are complete"
     );
 }
@@ -1264,7 +1270,12 @@ fn an_unreadable_hit_log_is_reported() {
     fs::set_permissions(&log, fs::Permissions::from_mode(0o000)).expect("make the log unreadable");
 
     if fs::read_to_string(&log).is_ok() {
-        // A user that ignores the file mode (root) cannot exercise this.
+        // A user that ignores the file mode (root) still reads it, so the log is
+        // readable and the report says what it holds.
+        assert!(
+            store.status(flag.as_id()).is_ok(),
+            "the log is readable for this user"
+        );
         return;
     }
     assert!(
@@ -1958,4 +1969,47 @@ fn a_sparse_split_that_is_not_two_and_thirty_eight_is_rejected() {
             "FlagId::parse({bad})"
         );
     }
+}
+
+#[test]
+fn a_mapping_shard_that_is_not_a_directory_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let shard = dir
+        .path()
+        .join("by-flag")
+        .join(flag.sparse_path())
+        .parent()
+        .expect("shard")
+        .to_path_buf();
+    fs::remove_dir_all(&shard).expect("remove the mapping shard");
+    fs::write(&shard, "not a directory").expect("put a file where the shard belongs");
+
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn an_unknown_field_in_a_record_is_read_past() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        flag_dir(dir.path(), &session, &flag).join("hits.log"),
+        "{\"ts\":\"2030-01-01T00:00:00Z\",\"extra\":true}\n",
+    )
+    .expect("write a hit with a field this version does not know");
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(
+        status.flags[0].hits, 1,
+        "the fields this version knows are read, the rest are passed over"
+    );
 }

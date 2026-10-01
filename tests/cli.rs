@@ -270,14 +270,32 @@ fn concurrent_verifications_from_separate_processes_all_land() {
                 .arg("--root")
                 .arg(root)
                 .args(["verify", &flag])
-                .stdout(Stdio::null())
+                .stdout(Stdio::piped())
                 .spawn()
                 .expect("spawn ckpt"),
         );
     }
-    for mut child in children {
-        assert!(child.wait().expect("wait").success());
+    let mut printed = Vec::new();
+    for child in children {
+        let out = child.wait_with_output().expect("wait");
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).expect("utf-8 stdout");
+        let count: u64 = text
+            .trim()
+            .rsplit_once("hits=")
+            .expect("hits=")
+            .1
+            .parse()
+            .expect("a count");
+        printed.push(count);
     }
+    assert_eq!(printed.len(), verifications);
+    assert!(
+        printed
+            .iter()
+            .all(|count| *count >= 1 && *count <= verifications as u64),
+        "a printed count is a count the log held: {printed:?}"
+    );
 
     let log = root
         .join("sessions")

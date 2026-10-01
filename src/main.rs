@@ -124,23 +124,13 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
             let flag = FlagId::parse(&flag)?;
             let recorded = store.verify(&flag, &Verify { note, at: None })?;
             // The count the log holds now, read back from the log itself so a
-            // hit which landed alongside this one is included. The hit is
-            // already written, so a read-back that fails is reported and the
-            // count this append recorded stands.
-            let hits = match store.flag_status(&flag) {
-                Ok(status) => status.hits,
-                Err(err) => {
-                    // The hit is recorded, so this is not a failed command; the
-                    // code says the book could not be read back, which a caller
-                    // can tell apart from "nothing was recorded".
-                    eprintln!(
-                        "ckpt: the hit was recorded, but reading it back failed, so the count below is the one from before it: {err}"
-                    );
-                    println!("flag {} hits={}", recorded.id, recorded.hits);
-                    return Ok(ExitCode::from(READ_BACK_FAILED));
-                }
-            };
+            // hit which landed alongside this one is included.
+            let read_back = store.flag_status(&flag).map(|status| status.hits);
+            let (hits, code) = reported_count(recorded.hits, read_back);
             println!("flag {} hits={hits}", recorded.id);
+            if code != 0 {
+                return Ok(ExitCode::from(code));
+            }
         }
         Command::Status { id, json } => {
             // Either kind of id is written the same way; which kind it is, the
@@ -155,6 +145,24 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// What `verify` prints and the code it exits with, from the count the append
+/// recorded and the attempt to read the log back.
+///
+/// A failed read-back is reported on standard error and gets its own code: the
+/// hit is recorded, so the command did its work, and a caller can tell that
+/// apart from nothing having been recorded.
+fn reported_count(recorded: u64, read_back: Result<u64, Error>) -> (u64, u8) {
+    match read_back {
+        Ok(hits) => (hits, 0),
+        Err(err) => {
+            eprintln!(
+                "ckpt: the hit was recorded, but reading it back failed, so the count below is the one from before it: {err}"
+            );
+            (recorded, READ_BACK_FAILED)
+        }
+    }
 }
 
 fn print_status(status: &Status) {
@@ -181,4 +189,29 @@ fn print_json<T: Serialize>(value: &T) {
         "{}",
         serde_json::to_string_pretty(value).expect("record-book values serialize")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_read_back_failure_reports_the_recorded_count_and_its_own_code() {
+        assert_eq!(
+            reported_count(2, Ok(5)),
+            (5, 0),
+            "the count that was read back is the one printed"
+        );
+
+        let unreadable = reported_count(
+            2,
+            Err(Error::NotFound {
+                kind: "flag",
+                id: "x".to_owned(),
+            }),
+        );
+        assert_eq!(unreadable.0, 2, "the recorded count stands");
+        assert_eq!(unreadable.1, READ_BACK_FAILED);
+        assert_eq!(READ_BACK_FAILED, 3, "the code is the one the README states");
+    }
 }
