@@ -2143,6 +2143,22 @@ fn a_rejected_addition_leaves_no_directory_behind() {
     );
 }
 
+fn count_files(dir: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|entry| {
+            if entry.path().is_dir() {
+                count_files(&entry.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
 #[test]
 #[cfg(unix)]
 fn a_failed_addition_takes_its_mapping_back() {
@@ -2164,6 +2180,11 @@ fn a_failed_addition_takes_its_mapping_back() {
         );
         return;
     }
+    assert_eq!(
+        count_files(&dir.path().join("by-flag")),
+        0,
+        "the mapping entry the failed addition wrote is gone, so no id is left mapped"
+    );
     assert!(
         store.sessions().is_ok(),
         "whatever the failed addition left is not reported as damage"
@@ -2190,6 +2211,23 @@ fn a_hard_link_at_a_mapping_entry_is_reported() {
     assert!(
         matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
         "a mapping entry shared with another name is refused"
+    );
+}
+
+#[test]
+fn a_mapping_entry_holding_more_than_an_id_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        dir.path().join("by-flag").join(flag.sparse_path()),
+        format!("  {session}\n"),
+    )
+    .expect("pad the mapping");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "the mapping holds one id, not a field to search through"
     );
 }
 

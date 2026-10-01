@@ -382,12 +382,14 @@ impl Store {
         let Some(text) = sparse::read_owned_file(&path)? else {
             return Ok(None);
         };
-        SessionId::parse(text.trim())
-            .map(Some)
-            .map_err(|_| Error::Corrupt {
-                path,
-                detail: "an index entry must be a session id".to_owned(),
-            })
+        // The writer ends the entry with a newline and writes nothing else, so
+        // nothing else is accepted: the mapping holds one id, not a field to
+        // search through.
+        let id = text.strip_suffix('\n').unwrap_or(&text);
+        SessionId::parse(id).map(Some).map_err(|_| Error::Corrupt {
+            path,
+            detail: "an index entry must be a session id and nothing else".to_owned(),
+        })
     }
 
     /// Map a ctf flag to the session that holds it.

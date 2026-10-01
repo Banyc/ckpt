@@ -88,6 +88,26 @@ fn json_reports_carry_the_id_they_matched() {
 }
 
 #[test]
+fn every_command_accepts_both_written_id_forms() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+
+    let sparse = format!("{}/{}", &session[..2], &session[2..]);
+    let upper = format!(
+        "{}/{}",
+        session[..2].to_uppercase(),
+        session[2..].to_uppercase()
+    );
+
+    let flag = ok(root, &["flag", "new", &sparse, "--desc", "f"]);
+    assert_eq!(flag.trim().len(), 40, "a sparse session id is taken");
+    assert!(ok(root, &["status", &upper]).contains(&session));
+    assert!(ok(root, &["verify", &flag.trim().to_uppercase()]).contains("hits=1"));
+}
+
+#[test]
 fn status_accepts_the_sparse_id_form() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();
