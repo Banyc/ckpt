@@ -1,0 +1,160 @@
+//! The `ckpt` command line.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
+use serde::Serialize;
+
+use ckpt::{Error, FlagId, Id, SessionId, Status, Store, Target, Verify};
+
+/// Record book for checkpoint flags.
+#[derive(Parser)]
+#[command(name = "ckpt", version, about = "Record book for checkpoint flags")]
+struct Cli {
+    /// Store root; defaults to $CKPT_ROOT, then $TMPDIR/ckpt
+    #[arg(long, global = true, value_name = "DIR")]
+    root: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Create a session, or list the record book's sessions
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+    /// Add a ctf flag to a session
+    Flag {
+        #[command(subcommand)]
+        command: FlagCommand,
+    },
+    /// Record a verification hit for a ctf flag
+    Verify {
+        /// ctf flag id, flat or sparse
+        flag: String,
+        /// Note to store with the hit
+        #[arg(long, value_name = "TEXT")]
+        note: Option<String>,
+    },
+    /// Print a session, looked up by session id or by any of its ctf flag ids
+    Status {
+        /// Session or ctf flag id, flat or sparse
+        id: String,
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Create a session and print its id
+    New {
+        /// What the session is for
+        #[arg(long, value_name = "TEXT")]
+        desc: String,
+    },
+    /// List every session in the record book
+    List {
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlagCommand {
+    /// Add a ctf flag to a session and print its id
+    New {
+        /// Session id, flat or sparse
+        session: String,
+        /// What the flag stands for
+        #[arg(long, value_name = "TEXT")]
+        desc: String,
+    },
+}
+
+fn main() -> ExitCode {
+    let Cli { root, command } = Cli::parse();
+    let store = root.map_or_else(Store::from_env, Store::at);
+    match run(&store, command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ckpt: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(store: &Store, command: Command) -> Result<(), Error> {
+    match command {
+        Command::Session { command } => match command {
+            SessionCommand::New { desc } => println!("{}", store.session_new(&desc)?),
+            SessionCommand::List { json } => {
+                let sessions = store.sessions()?;
+                if json {
+                    print_json(&sessions);
+                } else if sessions.is_empty() {
+                    println!("no sessions in {}", store.root().display());
+                } else {
+                    for session in &sessions {
+                        println!(
+                            "{}  flags {}  hits {}  {}",
+                            session.session, session.flags, session.hits, session.desc
+                        );
+                    }
+                }
+            }
+        },
+        Command::Flag { command } => match command {
+            FlagCommand::New { session, desc } => {
+                let session = SessionId::parse(&session)?;
+                println!("{}", store.flag_new(&session, &desc)?);
+            }
+        },
+        Command::Verify { flag, note } => {
+            let flag = FlagId::parse(&flag)?;
+            let status = store.verify(&flag, &Verify { note, at: None })?;
+            println!("flag {} hits={}", status.id, status.hits);
+        }
+        Command::Status { id, json } => {
+            let status = store.status(&Id::parse(&id)?)?;
+            if json {
+                print_json(&status);
+            } else {
+                print_status(&status);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_status(status: &Status) {
+    println!("session {}  created {}", status.session, status.created);
+    println!("desc    {}", status.desc);
+    println!("flags   {}", status.flags.len());
+    for flag in &status.flags {
+        let marker = match &status.matched {
+            Target::Flag { id } if id == &flag.id => "*",
+            _ => " ",
+        };
+        let last = flag
+            .last_hit
+            .map_or_else(|| "-".to_owned(), |ts| ts.to_string());
+        println!(
+            "{marker} {}  hits {:>4}  last {}  {}",
+            flag.id, flag.hits, last, flag.desc
+        );
+    }
+}
+
+fn print_json<T: Serialize>(value: &T) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).expect("record-book values serialize")
+    );
+}

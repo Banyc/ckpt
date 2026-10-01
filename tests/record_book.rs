@@ -1,0 +1,334 @@
+//! The record book's behavior over its on-disk tree.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use ckpt::{Error, FlagId, Id, SessionId, Store, Target, Verify};
+use jiff::Timestamp;
+use tempfile::TempDir;
+
+fn book() -> (TempDir, Store) {
+    let dir = TempDir::new().expect("temp dir");
+    let store = Store::at(dir.path());
+    (dir, store)
+}
+
+fn at(second: i64) -> Option<Timestamp> {
+    Some(Timestamp::from_second(second).expect("valid timestamp"))
+}
+
+fn verify_at(store: &Store, flag: &FlagId, second: i64) -> u64 {
+    store
+        .verify(
+            flag,
+            &Verify {
+                note: None,
+                at: at(second),
+            },
+        )
+        .expect("verify")
+        .hits
+}
+
+fn session_dir(root: &Path, session: &SessionId) -> PathBuf {
+    let (shard, rest) = session.as_id().sparse();
+    root.join("sessions").join(shard).join(rest)
+}
+
+fn flag_dir(root: &Path, session: &SessionId, flag: &FlagId) -> PathBuf {
+    let (shard, rest) = flag.as_id().sparse();
+    session_dir(root, session)
+        .join("flags")
+        .join(shard)
+        .join(rest)
+}
+
+#[test]
+fn a_session_lands_in_the_sparse_tree() {
+    let (dir, store) = book();
+    let session = store.session_new("perf plots").expect("session");
+
+    let (shard, rest) = session.as_id().sparse();
+    assert_eq!(shard.len(), 2);
+    assert_eq!(rest.len(), 38);
+
+    let session_dir = session_dir(dir.path(), &session);
+    assert!(session_dir.join("meta.json").is_file(), "meta.json exists");
+    assert!(session_dir.join("flags").is_dir(), "flags/ exists");
+    assert!(
+        session_dir
+            .join("flags")
+            .read_dir()
+            .expect("read flags")
+            .next()
+            .is_none(),
+        "a fresh session has no flags"
+    );
+    assert!(
+        fs::read_to_string(session_dir.join("meta.json"))
+            .expect("read meta")
+            .contains("perf plots"),
+        "the description is stored"
+    );
+}
+
+#[test]
+fn a_flag_lands_in_the_sparse_tree_with_an_empty_log() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "plot-read receipt").expect("flag");
+
+    let flag_dir = flag_dir(dir.path(), &session, &flag);
+    assert!(flag_dir.join("meta.json").is_file(), "meta.json exists");
+    assert_eq!(
+        fs::read_to_string(flag_dir.join("hits.log")).expect("read hits"),
+        "",
+        "a fresh flag has an empty hit log"
+    );
+}
+
+#[test]
+fn verify_counts_each_hit() {
+    let (_, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    assert_eq!(verify_at(&store, &flag, 1_000), 1);
+    assert_eq!(verify_at(&store, &flag, 1_001), 2);
+    assert_eq!(verify_at(&store, &flag, 1_002), 3);
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.flags.len(), 1);
+    assert_eq!(status.flags[0].hits, 3);
+    assert_eq!(status.flags[0].last_hit, at(1_002));
+}
+
+#[test]
+fn hits_are_counted_per_flag() {
+    let (_, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+
+    verify_at(&store, &first, 1_000);
+    verify_at(&store, &first, 1_001);
+    verify_at(&store, &second, 1_002);
+
+    let status = store.status(session.as_id()).expect("status");
+    let hits = |flag: &FlagId| {
+        status
+            .flags
+            .iter()
+            .find(|entry| &entry.id == flag)
+            .expect("flag is listed")
+            .hits
+    };
+    assert_eq!(hits(&first), 2);
+    assert_eq!(hits(&second), 1);
+}
+
+#[test]
+fn a_flag_id_names_the_session_that_holds_it() {
+    let (_, store) = book();
+    let first = store.session_new("first session").expect("session");
+    let second = store.session_new("second session").expect("session");
+    let flag = store.flag_new(&second, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let by_flag = store.status(flag.as_id()).expect("status");
+    assert_eq!(by_flag.session, second);
+    assert_eq!(
+        by_flag.matched,
+        Target::Flag { id: flag.clone() },
+        "the report says which id was asked for"
+    );
+    assert_eq!(by_flag.desc, "second session");
+    assert_eq!(by_flag.flags.len(), 1);
+
+    let by_session = store.status(first.as_id()).expect("status");
+    assert_eq!(by_session.session, first);
+    assert_eq!(by_session.matched, Target::Session);
+    assert!(by_session.flags.is_empty());
+}
+
+#[test]
+fn status_reads_the_tree_on_every_call() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    assert_eq!(store.status(flag.as_id()).expect("status").flags[0].hits, 0);
+
+    // A second writer appends a line without going through this Store.
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    let mut text = fs::read_to_string(&log).expect("read hits");
+    text.push_str("{\"ts\":\"2030-01-01T00:00:00Z\"}\n");
+    fs::write(&log, text).expect("append hit");
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.flags[0].hits, 1, "no cached count survives a write");
+    assert_eq!(
+        status.flags[0].last_hit,
+        at(1_893_456_000),
+        "the appended instant is read back"
+    );
+}
+
+#[test]
+fn hits_are_written_as_rfc3339() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    store
+        .verify(
+            &flag,
+            &Verify {
+                note: Some("saw it in the plot".to_owned()),
+                at: at(1_000_000_000),
+            },
+        )
+        .expect("verify");
+
+    let log = fs::read_to_string(flag_dir(dir.path(), &session, &flag).join("hits.log"))
+        .expect("read hits");
+    assert!(log.contains("\"ts\":\"2001-09-09T01:46:40Z\""), "{log}");
+    assert!(log.contains("saw it in the plot"), "{log}");
+}
+
+#[test]
+fn unknown_ids_are_not_found() {
+    let (_, store) = book();
+    assert!(store.sessions().expect("sessions").is_empty());
+
+    let absent_session = SessionId::generate();
+    assert!(matches!(
+        store.status(absent_session.as_id()),
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.flag_new(&absent_session, "flag"),
+        Err(Error::NotFound { .. })
+    ));
+
+    let absent_flag = FlagId::generate();
+    assert!(matches!(
+        store.verify(&absent_flag, &Verify::new()),
+        Err(Error::NotFound { .. })
+    ));
+}
+
+#[test]
+fn malformed_ids_are_rejected() {
+    let inputs = [
+        String::new(),
+        "abc".to_owned(),
+        "z".repeat(40),
+        "0".repeat(39),
+        "0".repeat(41),
+        "01/2345".to_owned(),
+        "012/3456789abcdef0123456789abcdef0123456".to_owned(),
+    ];
+    for input in &inputs {
+        assert!(
+            matches!(Id::parse(input), Err(Error::InvalidId { .. })),
+            "`{input}` must be rejected"
+        );
+    }
+}
+
+#[test]
+fn ids_accept_flat_sparse_and_uppercase_forms() {
+    let flat = "0123456789abcdef0123456789abcdef01234567";
+    let sparse = format!("{}/{}", &flat[..2], &flat[2..]);
+
+    assert_eq!(Id::parse(flat).expect("flat").as_str(), flat);
+    assert_eq!(Id::parse(&sparse).expect("sparse").as_str(), flat);
+    assert_eq!(
+        Id::parse(&flat.to_uppercase()).expect("uppercase").as_str(),
+        flat,
+        "object names are stored lowercased"
+    );
+}
+
+#[test]
+fn dotfiles_in_owned_directories_are_ignored() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let (shard, _) = session.as_id().sparse();
+    fs::write(
+        dir.path().join("sessions").join(shard).join(".DS_Store"),
+        "junk",
+    )
+    .expect("write dotfile");
+    fs::write(
+        flag_dir(dir.path(), &session, &flag).join(".DS_Store"),
+        "junk",
+    )
+    .expect("write dotfile");
+
+    assert_eq!(store.status(flag.as_id()).expect("status").flags[0].hits, 1);
+    assert_eq!(store.sessions().expect("sessions").len(), 1);
+}
+
+#[test]
+fn a_foreign_entry_in_an_owned_directory_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let (shard, _) = session.as_id().sparse();
+    fs::create_dir(dir.path().join("sessions").join(shard).join("not-an-id")).expect("create");
+
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_damaged_record_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    let mut text = fs::read_to_string(&log).expect("read hits");
+    text.push_str("not json\n");
+    fs::write(&log, text).expect("damage log");
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+        "an unparseable hit line is reported, not skipped"
+    );
+
+    let meta = session_dir(dir.path(), &session).join("meta.json");
+    fs::write(&meta, "not json").expect("damage meta");
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn sessions_are_listed_with_their_totals() {
+    let (_, store) = book();
+    let first = store.session_new("first").expect("session");
+    let second = store.session_new("second").expect("session");
+    let first_flag = store.flag_new(&first, "a").expect("flag");
+    store.flag_new(&first, "b").expect("flag");
+    verify_at(&store, &first_flag, 1_000);
+
+    let sessions = store.sessions().expect("sessions");
+    assert_eq!(sessions.len(), 2);
+    let listed = |session: &SessionId| {
+        sessions
+            .iter()
+            .find(|summary| &summary.session == session)
+            .expect("session is listed")
+    };
+    assert_eq!(listed(&first).flags, 2);
+    assert_eq!(listed(&first).hits, 1);
+    assert_eq!(listed(&second).flags, 0);
+    assert_eq!(listed(&second).hits, 0);
+    assert!(
+        sessions[0].session <= sessions[1].session,
+        "sessions are ordered by id"
+    );
+}
