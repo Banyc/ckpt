@@ -770,3 +770,73 @@ fn a_final_line_without_a_newline_is_read() {
     assert_eq!(status.flags[0].hits, 1);
     assert_eq!(status.flags[0].last_hit, at(1_893_456_000));
 }
+
+#[test]
+fn a_hit_is_appended_after_an_unterminated_line() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::write(&log, "{\"ts\":\"2030-01-01T00:00:00Z\"}").expect("write without a newline");
+
+    store
+        .verify(
+            &flag,
+            &Verify {
+                note: None,
+                at: at(1_000),
+            },
+        )
+        .expect("verify");
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(
+        status.flags[0].hits, 2,
+        "the hit already in the log survives the append"
+    );
+    assert_eq!(status.flags[0].last_hit, at(1_000));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read log").lines().count(),
+        2,
+        "the appended record did not merge into the one before it"
+    );
+}
+
+#[test]
+fn an_empty_foreign_shard_is_reported() {
+    let (dir, store) = book();
+    fs::create_dir_all(dir.path().join("sessions").join("zz")).expect("create");
+
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "a foreign shard is reported even when it holds nothing"
+    );
+}
+
+#[test]
+fn an_empty_foreign_flag_shard_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    fs::create_dir_all(session_dir(dir.path(), &session).join("flags").join("zz")).expect("create");
+
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_flag_is_not_added_to_a_corrupt_session() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    fs::write(
+        session_dir(dir.path(), &session).join("meta.json"),
+        "not json",
+    )
+    .expect("damage meta");
+
+    assert!(matches!(
+        store.flag_new(&session, "flag"),
+        Err(Error::Corrupt { .. })
+    ));
+}

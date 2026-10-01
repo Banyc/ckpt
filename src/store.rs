@@ -95,6 +95,9 @@ impl Store {
                 id: session.to_string(),
             });
         }
+        // The session's own `meta.json` must parse: a flag is not added to a
+        // record that already reads as corrupt.
+        read_meta(&dir)?;
         // The `flags/` entry belongs to the session. A missing or foreign one
         // is reported rather than created here, so a write never heals a
         // damaged tree behind the read paths' back.
@@ -109,11 +112,17 @@ impl Store {
         Ok(flag)
     }
 
-    /// Append one verification hit for `flag` and report its fresh count.
+    /// Append one verification hit for `flag` and report its count.
     ///
-    /// An `Ok` result means exactly one hit was appended. An error means the
-    /// record was rejected before anything was written, so a caller may retry
-    /// without double-counting.
+    /// The count is the number of hits the log held when this append was
+    /// prepared, plus this one. A concurrent append can land first, so the
+    /// number is a lower bound on the log's total; [`Store::status`] is the
+    /// authority on the total.
+    ///
+    /// An `Ok` result means one complete hit line was appended. An error means
+    /// no complete hit was appended: a damaged or foreign record is rejected
+    /// with the log untouched, while a short write can leave a partial line,
+    /// which the next read reports as damage.
     pub fn verify(&self, flag: &FlagId, settings: &Verify) -> Result<FlagStatus, Error> {
         let session = self.flag_owner(flag)?.ok_or_else(|| Error::NotFound {
             kind: "flag",
@@ -124,12 +133,13 @@ impl Store {
         // Read before writing: a damaged log is reported without a hit having
         // been appended.
         let meta = read_meta(&dir)?;
-        let hits = read_hits(&hits_path(&dir))?.len() as u64 + 1;
+        let log = read_hits(&hits_path(&dir))?;
+        let hits = log.entries.len() as u64 + 1;
         let hit = Hit {
             ts: settings.at.unwrap_or_else(Timestamp::now),
             note: settings.note.clone(),
         };
-        append_hit(&hits_path(&dir), &hit)?;
+        append_hit(&hits_path(&dir), &hit, log.terminated)?;
 
         Ok(FlagStatus {
             id: flag.clone(),
@@ -191,6 +201,7 @@ impl Store {
     fn session_ids(&self) -> Result<Vec<SessionId>, Error> {
         let mut ids = Vec::new();
         for (shard, shard_path) in owned_entries(&self.sessions_dir(), Missing::Empty)? {
+            require_shard(&shard, &shard_path)?;
             for (rest, rest_path) in owned_entries(&shard_path, Missing::Empty)? {
                 let session = SessionId::from_id(sparse_id(&shard, &rest, &rest_path)?);
                 if holds_record(&rest_path)? {
@@ -204,6 +215,7 @@ impl Store {
     fn flag_ids(&self, session: &SessionId) -> Result<Vec<FlagId>, Error> {
         let mut ids = Vec::new();
         for (shard, shard_path) in owned_entries(&self.flags_dir(session), Missing::Error)? {
+            require_shard(&shard, &shard_path)?;
             for (rest, rest_path) in owned_entries(&shard_path, Missing::Error)? {
                 let flag = FlagId::from_id(sparse_id(&shard, &rest, &rest_path)?);
                 if holds_record(&rest_path)? {
@@ -247,8 +259,8 @@ impl Store {
             id: flag.clone(),
             desc: meta.desc,
             created: meta.created,
-            hits: hits.len() as u64,
-            last_hit: hits.last().map(|hit| hit.ts),
+            hits: hits.entries.len() as u64,
+            last_hit: hits.entries.last().map(|hit| hit.ts),
         })
     }
 
@@ -369,6 +381,21 @@ fn require_directory(path: &Path) -> Result<(), Error> {
     })
 }
 
+/// Report a shard directory whose name is not exactly two lowercase-hex
+/// characters.
+///
+/// A shard is checked before its contents, so a foreign shard is reported even
+/// when it is empty and no object name is ever reassembled from it.
+fn require_shard(shard: &str, path: &Path) -> Result<(), Error> {
+    if shard.len() == SHARD_LEN && is_lowercase_hex(shard) {
+        return Ok(());
+    }
+    Err(Error::Corrupt {
+        path: path.to_path_buf(),
+        detail: format!("`{shard}` is not a {SHARD_LEN}-character lowercase hex object name"),
+    })
+}
+
 /// Reassemble the object name a sparse directory pair spells out.
 ///
 /// The layout is exactly two lowercase-hex characters over the remaining 38.
@@ -429,31 +456,50 @@ fn write_meta(dir: &Path, desc: &str) -> Result<(), Error> {
     fs::write(&path, format!("{text}\n")).map_err(|err| Error::io(&path, err))
 }
 
+/// The hits in a log, and whether the log ends at a line boundary.
+struct Hits {
+    entries: Vec<Hit>,
+    /// False when the final line has no terminating newline, so the next append
+    /// has to supply one before its own record.
+    terminated: bool,
+}
+
 /// Read every hit line. A blank or unparseable line is a damaged record: the
 /// writer only ever appends a complete JSON object, so anything else is
 /// reported rather than counted or skipped.
-fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
+fn read_hits(path: &Path) -> Result<Hits, Error> {
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
-    text.lines()
+    let entries = text
+        .lines()
         .map(|line| {
             serde_json::from_str(line).map_err(|err| Error::Corrupt {
                 path: path.to_path_buf(),
                 detail: err.to_string(),
             })
         })
-        .collect()
+        .collect::<Result<Vec<Hit>, Error>>()?;
+    Ok(Hits {
+        entries,
+        terminated: text.is_empty() || text.ends_with('\n'),
+    })
 }
 
 /// Append one hit as a single complete line.
 ///
 /// The whole line is built in one buffer and handed to one `write` call, and
 /// `O_APPEND` makes the offset update and that write atomic, so two concurrent
-/// verifications cannot interleave halves of a line.
-fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
-    let mut line = serde_json::to_string(hit).map_err(|err| Error::Corrupt {
+/// verifications cannot interleave halves of a line. A log whose last line was
+/// never terminated gets its separator in the same buffer, so the append cannot
+/// merge into the record already there.
+fn append_hit(path: &Path, hit: &Hit, terminated: bool) -> Result<(), Error> {
+    let mut line = String::new();
+    if !terminated {
+        line.push('\n');
+    }
+    line.push_str(&serde_json::to_string(hit).map_err(|err| Error::Corrupt {
         path: path.to_path_buf(),
         detail: err.to_string(),
-    })?;
+    })?);
     line.push('\n');
     let mut file = OpenOptions::new()
         .append(true)
