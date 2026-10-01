@@ -149,10 +149,14 @@ fn is_lowercase_hex(text: &str) -> bool {
 /// Whether the two directories directly above a record are real directories.
 ///
 /// `Ok(false)` means one of them is absent, so the record it would hold is
-/// absent too. A file or a symlink in their place is a foreign entry: it is
-/// reported rather than followed, so a link planted above a record cannot make
-/// a write land outside the store.
+/// absent too. A file or a symlink in the place of any of them is a foreign
+/// entry: it is reported rather than followed, so a link planted above a record
+/// cannot make a write land outside the store. A gap below does not hide a
+/// foreign entry above it.
 pub(crate) fn ancestors_are_real(dir: &Path) -> Result<bool, Error> {
+    let mut complete = true;
+    // Every ancestor is looked at, even after one is found missing: a foreign
+    // entry higher up is reported rather than hidden behind a gap below it.
     for ancestor in dir.ancestors().skip(1).take(2) {
         match fs::symlink_metadata(ancestor) {
             Ok(metadata) if metadata.is_dir() => {}
@@ -162,11 +166,11 @@ pub(crate) fn ancestors_are_real(dir: &Path) -> Result<bool, Error> {
                     detail: "a store directory must be a real directory".to_owned(),
                 });
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => complete = false,
             Err(err) => return Err(Error::io(ancestor, err)),
         }
     }
-    Ok(true)
+    Ok(complete)
 }
 
 /// Report a path that must be a real directory.

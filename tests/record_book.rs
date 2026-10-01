@@ -2013,3 +2013,111 @@ fn an_unknown_field_in_a_record_is_read_past() {
         "the fields this version knows are read, the rest are passed over"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_foreign_session_directory_is_reported_even_with_no_shard_below_it() {
+    // An empty root with a link at sessions: nothing is there yet, and the link
+    // is reported rather than answered as "no such id".
+    let (dir, store) = book();
+    let outside = TempDir::new().expect("temp dir");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("sessions")).expect("symlink");
+
+    let absent = SessionId::generate();
+    assert!(
+        matches!(store.status(absent.as_id()), Err(Error::Corrupt { .. })),
+        "the link is reported, not hidden behind the missing shard"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_foreign_mapping_directory_is_reported_even_with_no_shard_below_it() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::remove_file(dir.path().join("by-flag").join(flag.sparse_path())).expect("remove the entry");
+    fs::remove_dir_all(dir.path().join("by-flag")).expect("remove the mapping directory");
+    let outside = TempDir::new().expect("temp dir");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("by-flag")).expect("symlink");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a lookup reports the link in the mapping directory"
+    );
+}
+
+#[test]
+fn a_mapping_naming_a_session_that_holds_other_flags_is_reported() {
+    let (dir, store) = book();
+    let first = store.session_new("first").expect("session");
+    let second = store.session_new("second").expect("session");
+    let wanted = store.flag_new(&first, "wanted").expect("flag");
+    store.flag_new(&first, "sibling").expect("flag");
+    store.flag_new(&second, "other").expect("flag");
+
+    // The mapping points at a session that does hold flags, just not this one.
+    fs::write(
+        dir.path().join("by-flag").join(wanted.sparse_path()),
+        format!("{second}\n"),
+    )
+    .expect("point the mapping at the other session");
+
+    assert!(
+        matches!(store.flag_status(&wanted), Err(Error::NotFound { .. })),
+        "the named session does not hold this flag, whatever else it holds"
+    );
+    assert!(matches!(
+        store.status(wanted.as_id()),
+        Err(Error::NotFound { .. })
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_hard_link_at_a_meta_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let meta = flag_dir(dir.path(), &session, &flag).join("meta.json");
+    fs::hard_link(&meta, dir.path().join("elsewhere.json")).expect("hard link the meta");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a record file shared with another name is refused"
+    );
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_rejected_addition_leaves_no_directory_behind() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let outside = TempDir::new().expect("temp dir");
+    // A link where the mapping belongs, which the addition runs into first.
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("by-flag")).expect("symlink");
+    let flags = session_dir(dir.path(), &session).join("flags");
+
+    assert!(matches!(
+        store.flag_new(&session, "flag"),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_dir(&flags).expect("list").count(),
+        0,
+        "the rejected addition created no record directory"
+    );
+    assert!(
+        outside
+            .path()
+            .read_dir()
+            .expect("read outside")
+            .next()
+            .is_none(),
+        "and nothing outside the store"
+    );
+}

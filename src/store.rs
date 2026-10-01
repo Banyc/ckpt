@@ -143,10 +143,12 @@ impl Store {
         let counter = self.flag_ids(session)?.len() as u64 + 1;
 
         let flag = FlagId::generate();
+        // The mapping is written first, so a refusal there leaves nothing of the
+        // flag behind: what can be refused is refused before anything is made.
+        self.write_owner(session, &flag)?;
         let flag_dir = self.flag_dir(session, &flag);
         sparse::ensure_directory(&self.flag_shard_dir(session, &flag))?;
         sparse::create_record_dir(&flag_dir)?;
-        self.write_owner(session, &flag)?;
         let hits = hits_path(&flag_dir);
         sparse::write_new_file(&hits, "")?;
         write_record(
