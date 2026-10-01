@@ -33,7 +33,8 @@ Because a flag is stored inside its session, looking a flag up walks the
 `flags/` entry of every session. Reads always come from disk; nothing is cached,
 so a hit appended by another process is visible on the next read. A hit is
 written as one complete line in a single append, so concurrent verifications both
-land.
+land. `verify` prints the log's count when it reads back, and `status` is the
+authority on the total.
 
 ## Commands
 
@@ -41,7 +42,7 @@ land.
 ckpt session new --desc <TEXT>         create a session, print its id
 ckpt session list [--json]             list sessions
 ckpt flag new <SESSION> --desc <TEXT>  add a ctf flag, print its id
-ckpt verify <FLAG> [--note <TEXT>]     record a hit, print the new count
+ckpt verify <FLAG> [--note <TEXT>]     record a hit and print the count read back from the log
 ckpt status <SESSION|FLAG> [--json]    print a session, by either id
 ```
 

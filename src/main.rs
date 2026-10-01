@@ -32,7 +32,8 @@ enum Command {
         #[command(subcommand)]
         command: FlagCommand,
     },
-    /// Record a verification hit for a ctf flag
+    /// Record a verification hit for a ctf flag and print the hit count read
+    /// back from the log
     Verify {
         /// ctf flag id, flat or sparse
         flag: String,
@@ -118,8 +119,17 @@ fn run(store: &Store, command: Command) -> Result<(), Error> {
         },
         Command::Verify { flag, note } => {
             let flag = FlagId::parse(&flag)?;
-            let status = store.verify(&flag, &Verify { note, at: None })?;
-            println!("flag {} hits={}", status.id, status.hits);
+            let recorded = store.verify(&flag, &Verify { note, at: None })?;
+            // The count the log holds now, read after the append so that a hit
+            // which landed alongside this one is included. A read that fails
+            // leaves the count this append recorded: the hit is already
+            // written, so a display that cannot be read is not an error.
+            let hits = store
+                .status(flag.as_id())
+                .ok()
+                .and_then(|status| status.flags.into_iter().find(|entry| entry.id == flag))
+                .map_or(recorded.hits, |entry| entry.hits);
+            println!("flag {} hits={hits}", recorded.id);
         }
         Command::Status { id, json } => {
             let status = store.status(&Id::parse(&id)?)?;

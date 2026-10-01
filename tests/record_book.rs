@@ -873,6 +873,91 @@ fn sessions_as_a_regular_file_is_reported() {
 }
 
 #[test]
+fn a_non_canonical_rest_is_reported() {
+    // A canonical shard with a 37-character rest.
+    let (dir, store) = book();
+    let shard = dir.path().join("sessions").join("ab");
+    fs::create_dir_all(shard.join("0".repeat(37))).expect("create short rest");
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+
+    // A canonical shard with an uppercase rest: the case a case-folding read
+    // would turn into a second spelling of an object name already stored.
+    let (dir, store) = book();
+    let shard = dir.path().join("sessions").join("ab");
+    fs::create_dir_all(shard.join("AB".repeat(19))).expect("create upper rest");
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_flag_shard_on_the_read_path_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let outside = TempDir::new().expect("temp dir");
+    let shard = flag_dir(dir.path(), &session, &flag)
+        .parent()
+        .expect("parent")
+        .to_path_buf();
+    let moved = outside.path().join("shard");
+    fs::rename(&shard, &moved).expect("move the shard out");
+    std::os::unix::fs::symlink(&moved, &shard).expect("symlink");
+
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    let log = moved.join(flag.as_id().sparse().1).join("hits.log");
+    assert_eq!(
+        fs::read_to_string(log).expect("read log").lines().count(),
+        1,
+        "the rejected verification appended nothing"
+    );
+}
+
+#[test]
+fn a_hit_log_that_is_a_directory_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::remove_file(&log).expect("remove log");
+    fs::create_dir(&log).expect("put a directory at hits.log");
+
+    assert!(
+        matches!(
+            store.verify(&flag, &Verify::new()),
+            Err(Error::Corrupt { .. })
+        ),
+        "a known flag whose log cannot be written is an error, not a silent hit"
+    );
+    assert!(log.is_dir(), "nothing was written over it");
+}
+
+#[test]
+fn a_foreign_name_inside_a_record_directory_is_ignored() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    // A record directory is read by name, so names the store does not own there
+    // are left alone rather than reported.
+    fs::write(session_dir(dir.path(), &session).join("bogus"), "x").expect("write");
+    fs::write(flag_dir(dir.path(), &session, &flag).join("bogus"), "x").expect("write");
+
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.flags[0].hits, 1);
+    assert_eq!(store.sessions().expect("sessions").len(), 1);
+}
+
+#[test]
 fn an_empty_foreign_shard_is_reported() {
     let (dir, store) = book();
     fs::create_dir_all(dir.path().join("sessions").join("zz")).expect("create");

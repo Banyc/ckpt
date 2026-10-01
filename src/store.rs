@@ -20,6 +20,12 @@
 //! A directory at an object name with no regular `meta.json` is an interrupted
 //! write rather than a record, and is treated as absent: a partial write must
 //! not poison a record book that has no cleanup command.
+//!
+//! A record directory is read by name — its `meta.json` and `hits.log` — so
+//! other names inside it are ignored. The checks above are made before a path is
+//! used rather than while it is open: they refuse links and foreign entries left
+//! in the tree, they do not defend against another process swapping one in
+//! mid-operation, because the store belongs to the process reading it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -616,4 +622,50 @@ fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_shard_is_exactly_two_lowercase_hex_characters() {
+        let path = Path::new("shard");
+        for good in ["00", "09", "ab", "ff"] {
+            assert!(require_shard(good, path).is_ok(), "{good}");
+        }
+        for bad in ["", "0", "abc", "AB", "zz", "aG", "a0b"] {
+            assert!(
+                matches!(require_shard(bad, path), Err(Error::Corrupt { .. })),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rest_is_exactly_thirty_eight_lowercase_hex_characters() {
+        let path = Path::new("rest");
+        let flat = "0".repeat(HEX_LEN - SHARD_LEN);
+        assert!(sparse_id("ab", &flat, path).is_ok());
+
+        let mut upper = flat.clone();
+        upper.replace_range(37..38, "A");
+        assert!(matches!(
+            sparse_id("ab", &upper, path),
+            Err(Error::Corrupt { .. })
+        ));
+
+        for length in [0, 1, HEX_LEN - SHARD_LEN - 1, HEX_LEN - SHARD_LEN + 1] {
+            let short = "0".repeat(length);
+            assert!(
+                matches!(sparse_id("ab", &short, path), Err(Error::Corrupt { .. })),
+                "{length}"
+            );
+        }
+
+        assert!(matches!(
+            sparse_id("ab", &"z".repeat(HEX_LEN - SHARD_LEN), path),
+            Err(Error::Corrupt { .. })
+        ));
+    }
 }
