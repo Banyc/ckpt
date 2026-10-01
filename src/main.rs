@@ -127,7 +127,9 @@ fn run(store: &Store, command: Command) -> Result<(), Error> {
             let hits = match store.flag_status(&flag) {
                 Ok(status) => status.hits,
                 Err(err) => {
-                    eprintln!("ckpt: the hit was recorded, but reading it back failed: {err}");
+                    eprintln!(
+                        "ckpt: the hit was recorded, but reading it back failed, so the count below is the one from before it: {err}"
+                    );
                     recorded.hits
                 }
             };

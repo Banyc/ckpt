@@ -132,6 +132,10 @@ impl Store {
         // is reported rather than created here, so a write never heals a
         // damaged tree behind the read paths' back.
         sparse::require_directory(&self.flags_dir(session))?;
+        // The session's flags are walked before anything is created, so a
+        // rejected addition leaves no half-written record behind: the walk is
+        // what validates every shard and the mapping.
+        let counter = self.flag_ids(session)?.len() as u64 + 1;
 
         let flag = FlagId::generate();
         let flag_dir = self.flag_dir(session, &flag);
@@ -140,7 +144,6 @@ impl Store {
         self.write_owner(session, &flag)?;
         let hits = hits_path(&flag_dir);
         File::create(&hits).map_err(|err| Error::io(&hits, err))?;
-        let counter = self.flag_ids(session)?.len() as u64 + 1;
         write_record(
             &meta_path(&flag_dir),
             &FlagMeta {
@@ -334,14 +337,17 @@ impl Store {
     /// The one session a ctf flag is recorded under.
     ///
     /// The mapping says who holds it, and the answer is checked against the
-    /// owner's own tree, which is validated the same way a report validates it,
-    /// so a lookup never calls a damaged tree fine. An entry whose session does
-    /// not hold the flag is a leftover from an interrupted addition, and answers
-    /// "no such flag".
+    /// owner's own record: the session must read, and its flags are walked the
+    /// way a report walks them, so a lookup never calls a damaged tree fine. An
+    /// entry whose session does not hold the flag is a leftover from an
+    /// interrupted addition, and answers "no such flag".
     fn flag_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
         let Some(session) = self.read_owner(flag)? else {
             return Ok(None);
         };
+        // The owner must be a session that reads, so a hit is not written into
+        // a record every report calls corrupt.
+        read_session_meta(&self.session_dir(&session))?;
         if !self.flag_ids(&session)?.contains(flag) {
             return Ok(None);
         }

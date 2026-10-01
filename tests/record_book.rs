@@ -226,6 +226,7 @@ fn malformed_ids_are_rejected() {
         "01/2345".to_owned(),
         "012/3456789abcdef0123456789abcdef0123456".to_owned(),
         format!("0/{}", "1".repeat(39)),
+        format!("ab/{}/", "cd".repeat(19)),
         format!("{}/{}", "0".repeat(3), "1".repeat(37)),
     ];
     for input in &inputs {
@@ -1411,4 +1412,161 @@ fn a_mapping_that_is_not_a_session_id_is_reported() {
         store.status(flag.as_id()),
         Err(Error::Corrupt { .. })
     ));
+}
+
+#[test]
+fn a_corrupt_session_is_not_written_into_by_its_flags() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::write(
+        session_dir(dir.path(), &session).join("meta.json"),
+        "not json",
+    )
+    .expect("damage the session");
+
+    assert!(
+        matches!(
+            store.verify(&flag, &Verify::new()),
+            Err(Error::Corrupt { .. })
+        ),
+        "a hit is not appended into a session every report calls corrupt"
+    );
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read hits"),
+        "",
+        "nothing was written"
+    );
+}
+
+#[test]
+fn a_rejected_flag_addition_leaves_nothing_behind() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    fs::create_dir_all(session_dir(dir.path(), &session).join("flags").join("zz"))
+        .expect("create a foreign shard");
+    let before = fs::read_dir(session_dir(dir.path(), &session).join("flags"))
+        .expect("list")
+        .count();
+
+    assert!(matches!(
+        store.flag_new(&session, "flag"),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_dir(session_dir(dir.path(), &session).join("flags"))
+            .expect("list")
+            .count(),
+        before,
+        "the rejected addition created nothing"
+    );
+}
+
+#[test]
+fn a_hit_without_an_instant_is_recorded_now() {
+    let (_, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    let before = Timestamp::now();
+    let status = store.verify(&flag, &Verify::new()).expect("verify");
+    let after = Timestamp::now();
+
+    let recorded = status.last_hit.expect("the hit recorded an instant");
+    assert!(
+        before <= recorded && recorded <= after,
+        "{recorded} is not between {before} and {after}"
+    );
+}
+
+#[test]
+fn a_note_with_quotes_and_newlines_stays_one_line() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    store
+        .verify(
+            &flag,
+            &Verify {
+                note: Some("first\nsecond \"quoted\"".to_owned()),
+                at: at(1_000),
+            },
+        )
+        .expect("verify");
+
+    let text = fs::read_to_string(flag_dir(dir.path(), &session, &flag).join("hits.log"))
+        .expect("read hits");
+    assert_eq!(text.lines().count(), 1, "one line per hit, escapes and all");
+    assert_eq!(
+        store.status(flag.as_id()).expect("status").flags[0].hits,
+        1,
+        "and it reads back"
+    );
+}
+
+#[test]
+fn a_damaged_session_does_not_stop_another() {
+    let (dir, store) = book();
+    let good = store.session_new("good").expect("session");
+    let bad = store.session_new("bad").expect("session");
+    let flag = store.flag_new(&good, "flag").expect("flag");
+    let spoiled = store.flag_new(&bad, "flag").expect("flag");
+    fs::write(session_dir(dir.path(), &bad).join("meta.json"), "not json").expect("damage");
+
+    assert!(
+        store.verify(&flag, &Verify::new()).is_ok(),
+        "a lookup does not walk the damaged session"
+    );
+    assert!(store.flag_status(&flag).is_ok());
+    assert!(matches!(
+        store.verify(&spoiled, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.status(bad.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "and the book as a whole still reports the damage"
+    );
+}
+
+#[test]
+fn a_lookup_agrees_with_a_report() {
+    let (_, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    verify_at(&store, &flag, 1_000);
+
+    let looked_up = store.flag_status(&flag).expect("flag status");
+    let reported = store.status(flag.as_id()).expect("status");
+    assert_eq!(looked_up.hits, reported.flags[0].hits);
+    assert_eq!(looked_up.counter, reported.flags[0].counter);
+    assert_eq!(looked_up.last_hit, reported.flags[0].last_hit);
+}
+
+#[test]
+fn an_external_line_belongs_to_the_flag_that_holds_it() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+
+    let log = flag_dir(dir.path(), &session, &second).join("hits.log");
+    let mut text = fs::read_to_string(&log).expect("read the log");
+    text.push_str("{\"ts\":\"2030-01-01T00:00:00Z\"}\n");
+    fs::write(&log, text).expect("append out of band");
+
+    assert_eq!(store.flag_status(&second).expect("second").hits, 1);
+    assert_eq!(
+        store.flag_status(&first).expect("first").hits,
+        0,
+        "the sibling is untouched"
+    );
 }

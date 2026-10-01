@@ -25,8 +25,8 @@ entry:
         hits.log                    one JSON line per verification
 ```
 
-A session exists once its `meta.json` does; a ctf flag exists once its own
-`meta.json` does. Dotfiles in these directories are left alone, so an operating
+A session exists once its `meta.json` does, and a ctf flag exists once its own
+`meta.json` does inside a session that exists. Dotfiles in these directories are left alone, so an operating
 system droppings file does not disturb a read.
 
 A ctf flag's `counter` is the flags the session showed when it was added, plus
