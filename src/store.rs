@@ -356,6 +356,15 @@ impl Store {
                         detail: format!("`{flag}` is not mapped to the session that holds it"),
                     });
                 }
+                // An id that also names a session is reported wherever flags are
+                // listed, not only where that id is looked up.
+                let as_session = SessionId::from_id(flag.as_id().clone());
+                if holds_record(&self.session_dir(&as_session))? {
+                    return Err(Error::Corrupt {
+                        path: rest_path,
+                        detail: format!("`{flag}` is both a session and a ctf flag"),
+                    });
+                }
                 ids.push(flag);
             }
         }
@@ -414,17 +423,9 @@ impl Store {
         let Some(session) = self.read_owner(flag)? else {
             return Ok(None);
         };
-        // An id that is also a session is reported wherever it is looked up, not
-        // only by a report of that session.
-        let as_session = SessionId::from_id(flag.as_id().clone());
-        if holds_record(&self.session_dir(&as_session))? {
-            return Err(Error::Corrupt {
-                path: self.session_dir(&as_session),
-                detail: format!("`{flag}` is both a session and a ctf flag"),
-            });
-        }
         // The owner must be a record that reads, so a hit is not written into a
-        // session every report calls corrupt.
+        // session every report calls corrupt. Listing its flags is also what
+        // reports an id that names both a session and a ctf flag.
         if !holds_record(&self.session_dir(&session))? {
             return Err(Error::Corrupt {
                 path: self.owner_path(flag),
@@ -525,14 +526,31 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
 
     let meta = meta_path(dir);
     match fs::symlink_metadata(&meta) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(Error::io(&meta, err)),
-        Ok(metadata) if metadata.is_file() => Ok(true),
-        Ok(_) => Err(Error::Corrupt {
-            path: meta,
-            detail: "meta.json must be a regular file".to_owned(),
-        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(Error::io(&meta, err)),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(Error::Corrupt {
+                path: meta,
+                detail: "meta.json must be a regular file".to_owned(),
+            });
+        }
+        Ok(_) => {}
     }
+
+    // A shard holds only records: a name or an entry beside this one that is not
+    // one is reported, so a record is never read past a foreign sibling.
+    if let Some(shard) = dir.parent() {
+        let name = shard
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_owned();
+        for (rest, entry) in sparse::entries(shard, sparse::Missing::Empty)? {
+            sparse::require_directory(&entry)?;
+            sparse::sparse_id(&name, &rest, &entry)?;
+        }
+    }
+    Ok(true)
 }
 
 /// A report's order: by instant, then by counter, and where both are equal the
@@ -554,7 +572,16 @@ fn read_session_meta(dir: &Path) -> Result<SessionMeta, Error> {
 }
 
 fn read_flag_meta(dir: &Path) -> Result<FlagMeta, Error> {
-    read_record(&meta_path(dir))
+    let meta: FlagMeta = read_record(&meta_path(dir))?;
+    // The counter is the flags the session showed when this one was added, plus
+    // one, so a record claiming zero is not one the writer could have made.
+    if meta.counter == 0 {
+        return Err(Error::Corrupt {
+            path: meta_path(dir),
+            detail: "a flag's counter is at least one".to_owned(),
+        });
+    }
+    Ok(meta)
 }
 
 fn new_session_meta(desc: &str) -> SessionMeta {

@@ -51,7 +51,9 @@ name in `by-flag/` that nothing looks up is never read: an entry that is a
 directory, a link, or not a session id is reported when it is looked up, and an
 entry nothing looks up is not read at all. Reads always come from disk; nothing
 is cached, so a hit appended by another process is visible on the next read. A hit is written as
-one complete line in a single append, so concurrent verifications both land.
+one complete line in a single append, so concurrent verifications both land —
+unless a write is cut short, where the log is put back only when nothing landed
+after the partial line.
 `verify` prints the log's count when it reads back, and `status` is the authority
 on the total. If that read-back fails, `verify` says so on standard error, prints
 the count the append recorded instead, and exits `3` — the hit was recorded, so

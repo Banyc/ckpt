@@ -1289,6 +1289,7 @@ fn an_id_that_is_both_a_session_and_a_flag_is_reported() {
     let (dir, store) = book();
     let real = store.session_new("real").expect("session");
     let flag = store.flag_new(&real, "flag").expect("flag");
+    let sibling = store.flag_new(&real, "sibling").expect("flag");
     let impostor = store.session_new("impostor").expect("session");
 
     // Move the second session to the flag's object name, so one id names both.
@@ -1311,6 +1312,21 @@ fn an_id_that_is_both_a_session_and_a_flag_is_reported() {
         Err(Error::Corrupt { .. })
     ));
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+
+    // Listing the owner's flags is where the collision is seen, so a sibling of
+    // the colliding flag is refused too.
+    assert!(matches!(
+        store.status(real.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.flag_status(&sibling),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.verify(&sibling, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
 }
 
 #[test]
@@ -2294,4 +2310,40 @@ fn a_symlink_at_a_mapping_entry_is_reported() {
         store.verify(&flag, &Verify::new()),
         Err(Error::Corrupt { .. })
     ));
+}
+
+#[test]
+fn a_foreign_entry_beside_a_session_is_reported_by_its_status() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    fs::create_dir(
+        session_dir(dir.path(), &session)
+            .parent()
+            .expect("shard")
+            .join("not-an-id"),
+    )
+    .expect("put a foreign name beside the session");
+
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "a shard holds only records, and a status does not read past one"
+    );
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_flag_counter_of_zero_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let meta = flag_dir(dir.path(), &session, &flag).join("meta.json");
+    let text = fs::read_to_string(&meta).expect("read meta");
+    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
+    value["counter"] = serde_json::Value::from(0);
+    fs::write(&meta, format!("{value}\n")).expect("write a counter of zero");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "the counter counts the flags the session showed, so it starts at one"
+    );
 }

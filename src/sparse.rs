@@ -264,7 +264,9 @@ pub(crate) fn read_owned_file(path: &Path) -> Result<Option<String>, Error> {
 /// Write a file the store owns, which must not already be there.
 ///
 /// A file is written once: a name that already holds one is reported rather than
-/// overwritten, so a collision cannot destroy what landed there first. The
+/// overwritten, so a collision cannot destroy what landed there first — the name
+/// is checked before the content is written, and the move that follows replaces
+/// whatever is there at that instant. The
 /// content goes to a name beside it and is moved into place, so a write that
 /// fails part way leaves no record at all — a truncated record is worse than an
 /// absent one in a book that has no cleanup command.
@@ -295,15 +297,24 @@ pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
         .unwrap_or_else(|| "record".to_owned());
     let temp = path.with_file_name(format!("{name}.{}.tmp", &Id::generate().as_str()[..8]));
     if let Err(err) = fs::write(&temp, contents) {
-        // A name nothing reads is what a failed write is allowed to leave; the
-        // failure to remove it is not worth a second error.
-        let _ = fs::remove_file(&temp);
-        return Err(Error::io(&temp, err));
+        return Err(left_behind(&temp, err));
     }
-    fs::rename(&temp, path).map_err(|err| {
-        let _ = fs::remove_file(&temp);
-        Error::io(path, err)
-    })
+    fs::rename(&temp, path).map_err(|err| left_behind(&temp, err))
+}
+
+/// The error a failed write leaves, with a name it could not clean up said out
+/// loud: the name holds nothing a read uses, but a caller may want to remove it.
+fn left_behind(temp: &Path, err: io::Error) -> Error {
+    match fs::remove_file(temp) {
+        Ok(()) => Error::io(temp, err),
+        Err(cleanup) => Error::io(
+            temp,
+            io::Error::new(
+                cleanup.kind(),
+                format!("{err}; and the temporary name could not be removed: {cleanup}"),
+            ),
+        ),
+    }
 }
 
 #[cfg(test)]

@@ -416,6 +416,47 @@ fn a_write_that_cannot_finish_leaves_no_record() {
 
 #[test]
 #[cfg(unix)]
+fn a_short_append_keeps_the_hits_before_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+    let flag = ok(root, &["flag", "new", &session, "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+    let log = root
+        .join("sessions")
+        .join(&session[..2])
+        .join(&session[2..])
+        .join("flags")
+        .join(&flag[..2])
+        .join(&flag[2..])
+        .join("hits.log");
+
+    assert!(ok(root, &["verify", &flag]).contains("hits=1"));
+    let before = fs::read_to_string(&log).expect("read the log");
+    assert_eq!(before.lines().count(), 1);
+
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg("ulimit -f 1; exec \"$CKPT\" --root \"$ROOT\" verify \"$FLAG\" --note \"$NOTE\"")
+        .env("CKPT", env!("CARGO_BIN_EXE_ckpt"))
+        .env("ROOT", root)
+        .env("FLAG", &flag)
+        .env("NOTE", "x".repeat(2_000))
+        .output()
+        .expect("run ckpt under a file-size limit");
+    assert!(!out.status.success(), "the append could not complete");
+
+    assert_eq!(
+        fs::read_to_string(&log).expect("read the log"),
+        before,
+        "the hit already in the log survives the failed append"
+    );
+    assert!(ok(root, &["status", &flag]).contains("hits    1"));
+}
+
+#[test]
+#[cfg(unix)]
 fn a_short_append_leaves_the_log_as_it_was() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();
@@ -490,6 +531,28 @@ fn a_stdout_that_cannot_be_written_is_not_a_panic() {
         .arg("--root")
         .arg(root)
         .args(["status", &flag])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ckpt");
+    drop(child.stdout.take());
+    assert_eq!(child.wait().expect("wait").code(), Some(3));
+
+    // A session whose id could not be delivered says the same.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .arg("--root")
+        .arg(root)
+        .args(["session", "new", "--desc", "t"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ckpt");
+    drop(child.stdout.take());
+    assert_eq!(child.wait().expect("wait").code(), Some(3));
+
+    // A listing that could not be delivered.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .arg("--root")
+        .arg(root)
+        .args(["session", "list"])
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn ckpt");
