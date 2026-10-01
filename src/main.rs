@@ -79,11 +79,14 @@ enum FlagCommand {
     },
 }
 
+/// The exit code when a hit was recorded but could not be read back.
+const READ_BACK_FAILED: u8 = 3;
+
 fn main() -> ExitCode {
     let Cli { root, command } = Cli::parse();
     let store = root.map_or_else(Store::from_env, Store::at);
     match run(&store, command) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("ckpt: {err}");
             ExitCode::FAILURE
@@ -91,7 +94,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(store: &Store, command: Command) -> Result<(), Error> {
+fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
     match command {
         Command::Session { command } => match command {
             SessionCommand::New { desc } => println!("{}", store.session_new(&desc)?),
@@ -127,10 +130,14 @@ fn run(store: &Store, command: Command) -> Result<(), Error> {
             let hits = match store.flag_status(&flag) {
                 Ok(status) => status.hits,
                 Err(err) => {
+                    // The hit is recorded, so this is not a failed command; the
+                    // code says the book could not be read back, which a caller
+                    // can tell apart from "nothing was recorded".
                     eprintln!(
                         "ckpt: the hit was recorded, but reading it back failed, so the count below is the one from before it: {err}"
                     );
-                    recorded.hits
+                    println!("flag {} hits={}", recorded.id, recorded.hits);
+                    return Ok(ExitCode::from(READ_BACK_FAILED));
                 }
             };
             println!("flag {} hits={hits}", recorded.id);
@@ -147,7 +154,7 @@ fn run(store: &Store, command: Command) -> Result<(), Error> {
             }
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn print_status(status: &Status) {

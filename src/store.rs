@@ -128,6 +128,8 @@ impl Store {
         // The session's own `meta.json` must parse: a flag is not added to a
         // record that already reads as corrupt.
         read_session_meta(&dir)?;
+        // And its id must not be mapped as a flag, which a listing reports too.
+        self.require_not_both(&FlagId::from_id(session.as_id().clone()))?;
         // The `flags/` entry belongs to the session. A missing or foreign one
         // is reported rather than created here, so a write never heals a
         // damaged tree behind the read paths' back.
@@ -196,9 +198,11 @@ impl Store {
     /// The status of the session `id` names, where `id` may be a session id or
     /// the id of any of that session's ctf flags.
     ///
-    /// An id that names both a session and a ctf flag is reported rather than
-    /// resolved to one of them, so a flag id always leads to the session that
-    /// holds it.
+    /// The mapping decides whether an id is a ctf flag: an id that is mapped as
+    /// a flag and also names a session is reported rather than resolved to one
+    /// of them, so a flag id always leads to the session that holds it. A flag
+    /// the mapping does not name is not a flag to a lookup, and is reported by
+    /// the walk that lists the session holding it.
     pub fn status(&self, id: &Id) -> Result<Status, Error> {
         let session = SessionId::from_id(id.clone());
         let flag = FlagId::from_id(id.clone());
@@ -283,15 +287,7 @@ impl Store {
                 }
                 // An id that also names a ctf flag is reported rather than listed
                 // as a session as well.
-                if self
-                    .read_owner(&FlagId::from_id(session.as_id().clone()))?
-                    .is_some()
-                {
-                    return Err(Error::Corrupt {
-                        path: rest_path,
-                        detail: format!("`{session}` is both a session and a ctf flag"),
-                    });
-                }
+                self.require_not_both(&FlagId::from_id(session.as_id().clone()))?;
                 ids.push(session);
             }
         }
@@ -319,6 +315,20 @@ impl Store {
             }
         }
         Ok(ids)
+    }
+
+    /// Report an id that is mapped as a ctf flag and also names a session.
+    ///
+    /// A session's own id is not mapped to a flag, so both a listing of sessions
+    /// and an addition to one apply this before going further.
+    fn require_not_both(&self, flag: &FlagId) -> Result<(), Error> {
+        if self.read_owner(flag)?.is_some() {
+            return Err(Error::Corrupt {
+                path: self.owner_path(flag),
+                detail: format!("`{flag}` is both a session and a ctf flag"),
+            });
+        }
+        Ok(())
     }
 
     /// The session the mapping gives this ctf flag to.
@@ -365,14 +375,18 @@ impl Store {
                 detail: format!("`{flag}` is both a session and a ctf flag"),
             });
         }
-        // The owner must be a record the same checks accept, so its directories
-        // are checked before anything is read through them and a hit is never
-        // written into a record every report calls corrupt.
+        // The owner must be a record the same checks accept, and its flags are
+        // read the way a report reads them, so a lookup never calls a damaged
+        // session fine and a hit is never written into one.
         if !holds_record(&self.session_dir(&session))? {
             return Ok(None);
         }
         read_session_meta(&self.session_dir(&session))?;
-        if !self.flag_ids(&session)?.contains(flag) {
+        if !self
+            .flag_statuses(&session)?
+            .iter()
+            .any(|status| &status.id == flag)
+        {
             return Ok(None);
         }
         Ok(Some(session))

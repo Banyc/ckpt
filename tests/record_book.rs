@@ -1734,3 +1734,228 @@ fn a_report_orders_a_full_tie_by_object_name() {
     expected.sort();
     assert_eq!(order, expected, "a full tie is settled by object name");
 }
+
+#[test]
+fn a_damaged_sibling_flag_is_seen_by_a_lookup() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+    let log = flag_dir(dir.path(), &session, &first).join("hits.log");
+    fs::write(
+        flag_dir(dir.path(), &session, &second).join("meta.json"),
+        "not json",
+    )
+    .expect("damage the sibling");
+
+    assert!(
+        matches!(store.flag_status(&first), Err(Error::Corrupt { .. })),
+        "a lookup reads the owner's flags the way a report does"
+    );
+    assert!(matches!(
+        store.verify(&first, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read the log"),
+        "",
+        "nothing was appended to a session that reads as damaged"
+    );
+}
+
+#[test]
+fn a_damaged_sibling_log_is_seen_by_a_lookup() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let first = store.flag_new(&session, "first").expect("flag");
+    let second = store.flag_new(&session, "second").expect("flag");
+    fs::write(
+        flag_dir(dir.path(), &session, &second).join("hits.log"),
+        "not json\n",
+    )
+    .expect("damage the sibling's log");
+
+    assert!(matches!(
+        store.verify(&first, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_flag_meta_that_does_not_parse_stops_a_verification() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+    fs::write(
+        flag_dir(dir.path(), &session, &flag).join("meta.json"),
+        "not json",
+    )
+    .expect("damage the flag");
+
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read the log"),
+        "",
+        "the rejected verification appended nothing"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_sessions_directory_is_reported_by_a_lookup() {
+    // A complete store elsewhere, reached through a link at this store's
+    // sessions directory: the second directory level is what refuses it.
+    let (real_dir, real_store) = book();
+    let session = real_store.session_new("session").expect("session");
+    let flag = real_store.flag_new(&session, "flag").expect("flag");
+
+    let (linked_dir, linked_store) = book();
+    std::os::unix::fs::symlink(
+        real_dir.path().join("sessions"),
+        linked_dir.path().join("sessions"),
+    )
+    .expect("symlink the sessions directory");
+    // The mapping is there, so the lookup reaches the sessions tree, and what
+    // refuses it is the link two levels up.
+    let entry = linked_dir.path().join("by-flag").join(flag.sparse_path());
+    fs::create_dir_all(entry.parent().expect("parent")).expect("create");
+    fs::write(&entry, format!("{session}\n")).expect("write the mapping");
+
+    assert!(
+        matches!(linked_store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a link at sessions is refused two levels up"
+    );
+    assert!(matches!(
+        linked_store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(flag_dir(real_dir.path(), &session, &flag).join("hits.log"))
+            .expect("read the real log"),
+        "",
+        "nothing was written through it"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn a_symlinked_mapping_directory_is_reported_by_a_lookup() {
+    let (real_dir, real_store) = book();
+    let session = real_store.session_new("session").expect("session");
+    let flag = real_store.flag_new(&session, "flag").expect("flag");
+
+    let (linked_dir, linked_store) = book();
+    fs::create_dir_all(linked_dir.path()).expect("root");
+    std::os::unix::fs::symlink(
+        real_dir.path().join("by-flag"),
+        linked_dir.path().join("by-flag"),
+    )
+    .expect("symlink the mapping directory");
+
+    assert!(matches!(
+        linked_store.flag_status(&flag),
+        Err(Error::Corrupt { .. })
+    ));
+    assert!(matches!(
+        linked_store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn an_addition_refuses_an_id_that_is_both() {
+    let (dir, store) = book();
+    let real = store.session_new("real").expect("session");
+    let flag = store.flag_new(&real, "flag").expect("flag");
+    let impostor = store.session_new("impostor").expect("session");
+
+    let from = session_dir(dir.path(), &impostor);
+    let to = session_dir(dir.path(), &SessionId::from_id(flag.as_id().clone()));
+    fs::create_dir_all(to.parent().expect("parent")).expect("create");
+    fs::rename(&from, &to).expect("move the impostor session");
+
+    assert!(
+        matches!(
+            store.flag_new(&SessionId::from_id(flag.as_id().clone()), "another"),
+            Err(Error::Corrupt { .. })
+        ),
+        "an addition applies the same rule as a listing"
+    );
+}
+
+#[test]
+fn a_session_whose_id_is_mapped_is_reported_by_an_addition() {
+    let (dir, store) = book();
+    let real = store.session_new("real").expect("session");
+    store.flag_new(&real, "flag").expect("flag");
+    let impostor = store.session_new("impostor").expect("session");
+
+    // A mapping entry for the impostor's own id, naming another session.
+    let entry = dir.path().join("by-flag").join(impostor.sparse_path());
+    fs::create_dir_all(entry.parent().expect("parent")).expect("create");
+    fs::write(&entry, format!("{real}\n")).expect("write the mapping");
+
+    assert!(matches!(
+        store.flag_new(&impostor, "flag"),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn an_unmapped_flag_id_that_is_also_a_session_is_a_session() {
+    let (dir, store) = book();
+    let real = store.session_new("real").expect("session");
+    let flag = store.flag_new(&real, "flag").expect("flag");
+    let impostor = store.session_new("impostor").expect("session");
+
+    let from = session_dir(dir.path(), &impostor);
+    let to = session_dir(dir.path(), &SessionId::from_id(flag.as_id().clone()));
+    fs::create_dir_all(to.parent().expect("parent")).expect("create");
+    fs::rename(&from, &to).expect("move the impostor session");
+    fs::remove_file(dir.path().join("by-flag").join(flag.sparse_path()))
+        .expect("remove the mapping");
+
+    // The mapping decides whether an id is a flag, so with it gone this is a
+    // session; the flag it also names is reported by the walk that lists it.
+    let status = store.status(flag.as_id()).expect("status");
+    assert_eq!(status.session.as_id(), flag.as_id());
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_sparse_split_that_is_not_two_and_thirty_eight_is_rejected() {
+    let flat = "1".repeat(40);
+    let canonical = format!("{}/{}", &flat[..2], &flat[2..]);
+    assert!(
+        SessionId::parse(&canonical).is_ok(),
+        "the canonical split is the sparse form"
+    );
+
+    for bad in [
+        format!("0/{}", "1".repeat(39)),
+        format!("{}/{}", "0".repeat(3), "1".repeat(37)),
+        format!("ab/{}/", "cd".repeat(19)),
+    ] {
+        assert!(
+            matches!(SessionId::parse(&bad), Err(Error::InvalidId { .. })),
+            "SessionId::parse({bad})"
+        );
+        assert!(
+            matches!(FlagId::parse(&bad), Err(Error::InvalidId { .. })),
+            "FlagId::parse({bad})"
+        );
+    }
+}

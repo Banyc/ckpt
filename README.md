@@ -50,9 +50,11 @@ name in `by-flag/` that nothing looks up is never read; an entry that is a
 directory, a link, or not a session id is reported when it is looked up. Reads always come from disk; nothing is cached, so a
 hit appended by another process is visible on the next read. A hit is written as
 one complete line in a single append, so concurrent verifications both land.
-`verify` prints the log's count when it reads back; if that read fails it says so
-on standard error and prints the count the append recorded instead, and `status`
-is the authority on the total.
+`verify` prints the log's count when it reads back, and `status` is the authority
+on the total. If that read-back fails, `verify` says so on standard error, prints
+the count the append recorded instead, and exits `3` — the hit was recorded, so
+the command did not fail, but a caller can tell that the book could not be read
+back. Exit `1` means nothing was recorded.
 
 ## Commands
 
