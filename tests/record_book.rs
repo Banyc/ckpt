@@ -226,6 +226,8 @@ fn malformed_ids_are_rejected() {
         "0".repeat(41),
         "01/2345".to_owned(),
         "012/3456789abcdef0123456789abcdef0123456".to_owned(),
+        format!("0/{}", "1".repeat(39)),
+        format!("{}/{}", "0".repeat(3), "1".repeat(37)),
     ];
     for input in &inputs {
         assert!(
@@ -246,6 +248,17 @@ fn ids_accept_flat_sparse_and_uppercase_forms() {
         Id::parse(&flat.to_uppercase()).expect("uppercase").as_str(),
         flat,
         "object names are stored lowercased"
+    );
+    assert_eq!(
+        Id::parse(&format!(
+            "{}/{}",
+            flat[..2].to_uppercase(),
+            flat[2..].to_uppercase()
+        ))
+        .expect("uppercase sparse")
+        .as_str(),
+        flat,
+        "a sparse argument is normalized like a flat one"
     );
 }
 
@@ -756,50 +769,107 @@ fn a_non_utf8_entry_name_is_reported() {
 }
 
 #[test]
-fn a_final_line_without_a_newline_is_read() {
-    let (dir, store) = book();
-    let session = store.session_new("session").expect("session");
-    let flag = store.flag_new(&session, "flag").expect("flag");
-    fs::write(
-        flag_dir(dir.path(), &session, &flag).join("hits.log"),
-        "{\"ts\":\"2030-01-01T00:00:00Z\"}",
-    )
-    .expect("write a line without a newline");
-
-    let status = store.status(flag.as_id()).expect("status");
-    assert_eq!(status.flags[0].hits, 1);
-    assert_eq!(status.flags[0].last_hit, at(1_893_456_000));
-}
-
-#[test]
-fn a_hit_is_appended_after_an_unterminated_line() {
+fn a_final_line_without_a_newline_is_reported() {
     let (dir, store) = book();
     let session = store.session_new("session").expect("session");
     let flag = store.flag_new(&session, "flag").expect("flag");
     let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
     fs::write(&log, "{\"ts\":\"2030-01-01T00:00:00Z\"}").expect("write without a newline");
 
-    store
-        .verify(
-            &flag,
-            &Verify {
-                note: None,
-                at: at(1_000),
-            },
-        )
-        .expect("verify");
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+        "the writer terminates every line, so an unterminated one is damage"
+    );
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Corrupt { .. })
+    ));
+    assert_eq!(
+        fs::read_to_string(&log).expect("read log"),
+        "{\"ts\":\"2030-01-01T00:00:00Z\"}",
+        "a rejected verification appends nothing"
+    );
+}
 
-    let status = store.status(flag.as_id()).expect("status");
-    assert_eq!(
-        status.flags[0].hits, 2,
-        "the hit already in the log survives the append"
+#[test]
+fn a_flag_lookup_reports_a_missing_flag_directory() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::remove_dir_all(session_dir(dir.path(), &session).join("flags")).expect("remove flags");
+
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Io { .. })),
+        "a flag lookup reports the damaged session, it does not answer 'no such flag'"
     );
-    assert_eq!(status.flags[0].last_hit, at(1_000));
-    assert_eq!(
-        fs::read_to_string(&log).expect("read log").lines().count(),
-        2,
-        "the appended record did not merge into the one before it"
+    assert!(matches!(
+        store.verify(&flag, &Verify::new()),
+        Err(Error::Io { .. })
+    ));
+}
+
+#[test]
+fn an_interrupted_write_is_invisible() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flat = session.as_id().as_str().to_owned();
+    fs::remove_file(session_dir(dir.path(), &session).join("meta.json")).expect("remove meta");
+
+    assert!(
+        store.sessions().expect("sessions").is_empty(),
+        "a directory with no meta.json is an interrupted write, not a record"
     );
+
+    // The same at the flag level: hits.log is created before meta.json, so an
+    // interrupted flag_new leaves exactly this.
+    let session = store.session_new("other").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::remove_file(flag_dir(dir.path(), &session, &flag).join("meta.json")).expect("remove meta");
+    let status = store.status(session.as_id()).expect("status");
+    assert!(
+        status.flags.is_empty(),
+        "the remains are not listed as a flag"
+    );
+
+    assert!(
+        !flat.is_empty() && store.status(session.as_id()).is_ok(),
+        "the store keeps answering for the sessions that are complete"
+    );
+}
+
+#[test]
+fn a_record_of_the_wrong_shape_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+
+    // Valid JSON, but not a hit.
+    fs::write(
+        flag_dir(dir.path(), &session, &flag).join("hits.log"),
+        "{\"note\":\"x\"}\n",
+    )
+    .expect("write a wrong-shaped hit");
+    assert!(matches!(
+        store.status(flag.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+
+    // Valid JSON, but not a record.
+    fs::write(session_dir(dir.path(), &session).join("meta.json"), "{}\n")
+        .expect("write a wrong-shaped meta");
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn sessions_as_a_regular_file_is_reported() {
+    let (dir, store) = book();
+    fs::create_dir_all(dir.path()).expect("create root");
+    fs::write(dir.path().join("sessions"), "not a directory").expect("write sessions");
+
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }
 
 #[test]

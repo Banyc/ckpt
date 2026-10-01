@@ -16,6 +16,10 @@
 //! `meta.json` is a record, and anything else — a file, a symlink, or a
 //! `meta.json` that is not a regular file — is reported as a foreign entry
 //! rather than read or written through.
+//!
+//! A directory at an object name with no regular `meta.json` is an interrupted
+//! write rather than a record, and is treated as absent: a partial write must
+//! not poison a record book that has no cleanup command.
 
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -89,7 +93,7 @@ impl Store {
         ensure_directory(&self.sessions_dir())?;
         ensure_directory(&self.session_shard_dir(&session))?;
         let dir = self.session_dir(&session);
-        ensure_directory(&dir)?;
+        create_record_dir(&dir)?;
         ensure_directory(&self.flags_dir(&session))?;
         write_meta(&dir, desc)?;
         Ok(session)
@@ -115,7 +119,7 @@ impl Store {
         let flag = FlagId::generate();
         let flag_dir = self.flag_dir(session, &flag);
         ensure_directory(&self.flag_shard_dir(session, &flag))?;
-        ensure_directory(&flag_dir)?;
+        create_record_dir(&flag_dir)?;
         let hits = hits_path(&flag_dir);
         File::create(&hits).map_err(|err| Error::io(&hits, err))?;
         write_meta(&flag_dir, desc)?;
@@ -143,13 +147,12 @@ impl Store {
         // Read before writing: a damaged log is reported without a hit having
         // been appended.
         let meta = read_meta(&dir)?;
-        let log = read_hits(&hits_path(&dir))?;
-        let hits = log.entries.len() as u64 + 1;
+        let hits = read_hits(&hits_path(&dir))?.len() as u64 + 1;
         let hit = Hit {
             ts: settings.at.unwrap_or_else(Timestamp::now),
             note: settings.note.clone(),
         };
-        append_hit(&hits_path(&dir), &hit, log.terminated)?;
+        append_hit(&hits_path(&dir), &hit)?;
 
         Ok(FlagStatus {
             id: flag.clone(),
@@ -254,6 +257,9 @@ impl Store {
     fn flag_owner(&self, flag: &FlagId) -> Result<Option<SessionId>, Error> {
         let mut owner: Option<SessionId> = None;
         for session in self.session_ids()? {
+            // The session exists, so its `flags/` entry must too: a flag lookup
+            // reports a damaged tree instead of answering "no such flag".
+            require_directory(&self.flags_dir(&session))?;
             let dir = self.flag_dir(&session, flag);
             if !holds_record(&dir)? {
                 continue;
@@ -277,8 +283,8 @@ impl Store {
             id: flag.clone(),
             desc: meta.desc,
             created: meta.created,
-            hits: hits.entries.len() as u64,
-            last_hit: hits.entries.last().map(|hit| hit.ts),
+            hits: hits.len() as u64,
+            last_hit: hits.last().map(|hit| hit.ts),
         })
     }
 
@@ -357,11 +363,13 @@ fn owned_entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>,
 
 /// Whether a directory holds a record.
 ///
-/// A missing directory holds nothing, and a real directory with a regular
-/// `meta.json` holds one. A file or symlink at the object name, a shard above it
-/// that is not a real directory, or a `meta.json` that is not a regular file is
-/// a foreign entry: it is reported rather than read as an absent record, so a
-/// damaged tree cannot answer "no such session".
+/// A missing directory holds nothing. A real directory with a regular
+/// `meta.json` holds one. A directory without a `meta.json` is the remains of an
+/// interrupted write, and is absent too, so a partial write cannot poison a
+/// record book that has no cleanup command. A file or symlink at the object
+/// name, a shard above it that is not a real directory, or a `meta.json` that is
+/// not a regular file is a foreign entry: it is reported rather than read as an
+/// absent record, so a damaged tree cannot answer "no such session".
 fn holds_record(dir: &Path) -> Result<bool, Error> {
     if !ancestors_are_real(dir)? {
         return Ok(false);
@@ -433,6 +441,25 @@ fn ensure_directory(path: &Path) -> Result<(), Error> {
     match fs::create_dir(path) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_directory(path),
+        Err(err) => Err(Error::io(path, err)),
+    }
+}
+
+/// Create a fresh record directory, which must not already exist.
+///
+/// A shard directory may be shared by many records, so it is created tolerantly;
+/// a record directory belongs to one id, and reusing the name would overwrite
+/// the record already there.
+fn create_record_dir(path: &Path) -> Result<(), Error> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(Error::io(
+            path,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "an object name already holds a record",
+            ),
+        )),
         Err(err) => Err(Error::io(path, err)),
     }
 }
@@ -539,52 +566,41 @@ fn write_meta(dir: &Path, desc: &str) -> Result<(), Error> {
     fs::write(&path, format!("{text}\n")).map_err(|err| Error::io(&path, err))
 }
 
-/// The hits in a log, and whether the log ends at a line boundary.
-struct Hits {
-    entries: Vec<Hit>,
-    /// False when the final line has no terminating newline, so the next append
-    /// has to supply one before its own record.
-    terminated: bool,
-}
-
-/// Read every hit line. A blank or unparseable line is a damaged record: the
-/// writer only ever appends a complete JSON object, so anything else is
-/// reported rather than counted or skipped.
-fn read_hits(path: &Path) -> Result<Hits, Error> {
+/// The hits in a log.
+///
+/// A blank or unparseable line is a damaged record: the writer only ever appends
+/// a complete JSON object followed by a newline, so anything else is reported
+/// rather than counted or skipped.
+fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
     require_regular_file(path)?;
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
-    let entries = text
-        .lines()
+    if !text.is_empty() && !text.ends_with('\n') {
+        return Err(Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: "the final line has no terminating newline".to_owned(),
+        });
+    }
+    text.lines()
         .map(|line| {
             serde_json::from_str(line).map_err(|err| Error::Corrupt {
                 path: path.to_path_buf(),
                 detail: err.to_string(),
             })
         })
-        .collect::<Result<Vec<Hit>, Error>>()?;
-    Ok(Hits {
-        entries,
-        terminated: text.is_empty() || text.ends_with('\n'),
-    })
+        .collect()
 }
 
 /// Append one hit as a single complete line.
 ///
 /// The whole line is built in one buffer and handed to one `write` call, and
 /// `O_APPEND` makes the offset update and that write atomic, so two concurrent
-/// verifications cannot interleave halves of a line. A log whose last line was
-/// never terminated gets its separator in the same buffer, so the append cannot
-/// merge into the record already there.
-fn append_hit(path: &Path, hit: &Hit, terminated: bool) -> Result<(), Error> {
+/// verifications cannot interleave halves of a line.
+fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
     require_regular_file(path)?;
-    let mut line = String::new();
-    if !terminated {
-        line.push('\n');
-    }
-    line.push_str(&serde_json::to_string(hit).map_err(|err| Error::Corrupt {
+    let mut line = serde_json::to_string(hit).map_err(|err| Error::Corrupt {
         path: path.to_path_buf(),
         detail: err.to_string(),
-    })?);
+    })?;
     line.push('\n');
     let mut file = OpenOptions::new()
         .append(true)
