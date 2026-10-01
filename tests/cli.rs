@@ -103,6 +103,41 @@ fn a_bad_id_exits_one_with_a_readable_error() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("no session"));
 }
 
+fn ckpt_env(root: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .env("CKPT_ROOT", root)
+        .args(args)
+        .output()
+        .expect("run ckpt")
+}
+
+#[test]
+fn ckpt_root_selects_the_store_when_no_root_flag_is_given() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let out = ckpt_env(
+        dir.path(),
+        &["session", "new", "--desc", "from the environment"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let session = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let session = session.trim();
+    assert_eq!(session.len(), 40);
+    assert!(
+        dir.path()
+            .join("sessions")
+            .join(&session[..2])
+            .join(&session[2..])
+            .join("meta.json")
+            .is_file(),
+        "the session landed under CKPT_ROOT"
+    );
+}
+
 #[test]
 fn an_empty_store_reports_itself() {
     let dir = tempfile::tempdir().expect("temp dir");

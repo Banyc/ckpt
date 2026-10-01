@@ -456,6 +456,69 @@ fn descriptions_round_trip() {
 }
 
 #[test]
+fn a_file_where_a_record_belongs_is_reported() {
+    let (dir, store) = book();
+    let stray = dir.path().join("sessions").join("ab").join("0".repeat(38));
+    fs::create_dir_all(stray.parent().expect("parent")).expect("create");
+    fs::write(&stray, "not a record").expect("write stray");
+
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "a file at an object name is a foreign entry, not an absent session"
+    );
+}
+
+#[test]
+fn a_file_where_a_flag_belongs_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let stray = session_dir(dir.path(), &session)
+        .join("flags")
+        .join("ab")
+        .join("0".repeat(38));
+    fs::create_dir_all(stray.parent().expect("parent")).expect("create");
+    fs::write(&stray, "not a record").expect("write stray");
+
+    assert!(matches!(
+        store.status(session.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_blank_hit_line_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let log = flag_dir(dir.path(), &session, &flag).join("hits.log");
+
+    assert_eq!(store.status(flag.as_id()).expect("status").flags[0].hits, 0);
+
+    fs::write(&log, "\n").expect("write blank line");
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::Corrupt { .. })),
+        "the writer only appends complete records, so a blank line is damage"
+    );
+}
+
+#[test]
+fn a_flag_under_a_session_without_meta_is_not_found() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::remove_file(session_dir(dir.path(), &session).join("meta.json")).expect("remove meta");
+
+    assert!(
+        matches!(store.status(flag.as_id()), Err(Error::NotFound { .. })),
+        "a session exists once its meta.json does"
+    );
+    assert!(matches!(
+        store.flag_new(&session, "another"),
+        Err(Error::NotFound { .. })
+    ));
+}
+
+#[test]
 fn a_flag_lookup_counts_only_its_own_session() {
     let (_, store) = book();
     let first = store.session_new("first").expect("session");

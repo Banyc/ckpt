@@ -165,7 +165,8 @@ impl Store {
         for (shard, shard_path) in owned_entries(&self.sessions_dir(), Missing::Empty)? {
             for (rest, rest_path) in owned_entries(&shard_path, Missing::Empty)? {
                 let session = SessionId::from_id(sparse_id(&shard, &rest, &rest_path)?);
-                if meta_path(&self.session_dir(&session)).is_file() {
+                require_directory(&rest_path)?;
+                if meta_path(&rest_path).is_file() {
                     ids.push(session);
                 }
             }
@@ -178,7 +179,8 @@ impl Store {
         for (shard, shard_path) in owned_entries(&self.flags_dir(session), Missing::Error)? {
             for (rest, rest_path) in owned_entries(&shard_path, Missing::Error)? {
                 let flag = FlagId::from_id(sparse_id(&shard, &rest, &rest_path)?);
-                if meta_path(&self.flag_dir(session, &flag)).is_file() {
+                require_directory(&rest_path)?;
+                if meta_path(&rest_path).is_file() {
                     ids.push(flag);
                 }
             }
@@ -302,6 +304,22 @@ fn is_lowercase_hex(text: &str) -> bool {
         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// A record at an object name must be a real directory.
+///
+/// A file or a symlink at a name the store would have written itself is a
+/// foreign entry, not an absent record, so it is reported rather than skipped
+/// as "no such session".
+fn require_directory(path: &Path) -> Result<(), Error> {
+    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
+    if metadata.is_dir() {
+        return Ok(());
+    }
+    Err(Error::Corrupt {
+        path: path.to_path_buf(),
+        detail: "an object name must be a directory".to_owned(),
+    })
+}
+
 fn meta_path(dir: &Path) -> PathBuf {
     dir.join("meta.json")
 }
@@ -332,10 +350,12 @@ fn write_meta(dir: &Path, desc: &str) -> Result<(), Error> {
     fs::write(&path, format!("{text}\n")).map_err(|err| Error::io(&path, err))
 }
 
+/// Read every hit line. A blank or unparseable line is a damaged record: the
+/// writer only ever appends a complete JSON object, so anything else is
+/// reported rather than counted or skipped.
 fn read_hits(path: &Path) -> Result<Vec<Hit>, Error> {
     let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
     text.lines()
-        .filter(|line| !line.trim().is_empty())
         .map(|line| {
             serde_json::from_str(line).map_err(|err| Error::Corrupt {
                 path: path.to_path_buf(),
