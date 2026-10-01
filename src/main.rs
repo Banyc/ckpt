@@ -1,5 +1,6 @@
 //! The `ckpt` command line.
 
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -79,8 +80,28 @@ enum FlagCommand {
     },
 }
 
-/// The exit code when a hit was recorded but could not be read back.
-const READ_BACK_FAILED: u8 = 3;
+/// The exit code when a command did its work but could not report it.
+const REPORT_FAILED: u8 = 3;
+
+/// Write one line to standard output, reporting a failed write rather than
+/// panicking on it: a pipeline that closes early is not a crash.
+fn report(line: &str) -> Result<(), Error> {
+    use std::io::Write;
+
+    writeln!(io::stdout().lock(), "{line}").map_err(|err| Error::io("stdout", err))
+}
+
+/// Report what a command did, or say on standard error that it was done and
+/// could not be reported. The work is not repeated and not undone.
+fn report_done(line: &str, what: &str) -> ExitCode {
+    match report(line) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ckpt: {what}, but reporting it failed: {err}; {line}");
+            ExitCode::from(REPORT_FAILED)
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let Cli { root, command } = Cli::parse();
@@ -97,19 +118,25 @@ fn main() -> ExitCode {
 fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
     match command {
         Command::Session { command } => match command {
-            SessionCommand::New { desc } => println!("{}", store.session_new(&desc)?),
+            SessionCommand::New { desc } => {
+                let session = store.session_new(&desc)?;
+                return Ok(report_done(
+                    &session.to_string(),
+                    &format!("session {session} was created"),
+                ));
+            }
             SessionCommand::List { json } => {
                 let sessions = store.sessions()?;
                 if json {
-                    print_json(&sessions);
+                    print_json(&sessions)?;
                 } else if sessions.is_empty() {
-                    println!("no sessions in {}", store.root().display());
+                    report(&format!("no sessions in {}", store.root().display()))?;
                 } else {
                     for session in &sessions {
-                        println!(
+                        report(&format!(
                             "{}  flags {}  hits {}  {}",
                             session.session, session.flags, session.hits, session.desc
-                        );
+                        ))?;
                     }
                 }
             }
@@ -117,7 +144,11 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
         Command::Flag { command } => match command {
             FlagCommand::New { session, desc } => {
                 let session = SessionId::parse(&session)?;
-                println!("{}", store.flag_new(&session, &desc)?);
+                let flag = store.flag_new(&session, &desc)?;
+                return Ok(report_done(
+                    &flag.to_string(),
+                    &format!("flag {flag} was created"),
+                ));
             }
         },
         Command::Verify { flag, note } => {
@@ -127,10 +158,15 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
             // hit which landed alongside this one is included.
             let read_back = store.flag_status(&flag).map(|status| status.hits);
             let (hits, code) = reported_count(recorded.hits, read_back);
-            println!("flag {} hits={hits}", recorded.id);
-            if code != 0 {
-                return Ok(ExitCode::from(code));
-            }
+            let line = format!("flag {} hits={hits}", recorded.id);
+            // Whatever went wrong, the hit is in the log: the code says so even
+            // when the count could not be written out.
+            let reported = report_done(&line, "the hit was recorded");
+            return Ok(if code != 0 {
+                ExitCode::from(code)
+            } else {
+                reported
+            });
         }
         Command::Status { id, json } => {
             // Either kind of id is written the same way; which kind it is, the
@@ -138,9 +174,9 @@ fn run(store: &Store, command: Command) -> Result<ExitCode, Error> {
             let id = SessionId::parse(&id)?;
             let status = store.status(id.as_id())?;
             if json {
-                print_json(&status);
+                print_json(&status)?;
             } else {
-                print_status(&status);
+                print_status(&status)?;
             }
         }
     }
@@ -160,15 +196,18 @@ fn reported_count(recorded: u64, read_back: Result<u64, Error>) -> (u64, u8) {
             eprintln!(
                 "ckpt: the hit was recorded, but reading it back failed, so the count below is the one from before it: {err}"
             );
-            (recorded, READ_BACK_FAILED)
+            (recorded, REPORT_FAILED)
         }
     }
 }
 
-fn print_status(status: &Status) {
-    println!("session {}  created {}", status.session, status.created);
-    println!("desc    {}", status.desc);
-    println!("flags   {}", status.flags.len());
+fn print_status(status: &Status) -> Result<(), Error> {
+    report(&format!(
+        "session {}  created {}",
+        status.session, status.created
+    ))?;
+    report(&format!("desc    {}", status.desc))?;
+    report(&format!("flags   {}", status.flags.len()))?;
     for flag in &status.flags {
         let marker = match &status.matched {
             Target::Flag { id } if id == &flag.id => "*",
@@ -177,18 +216,17 @@ fn print_status(status: &Status) {
         let last = flag
             .last_hit
             .map_or_else(|| "-".to_owned(), |ts| ts.to_string());
-        println!(
+        report(&format!(
             "{marker} {}  hits {:>4}  last {}  {}",
             flag.id, flag.hits, last, flag.desc
-        );
+        ))?;
     }
+    Ok(())
 }
 
-fn print_json<T: Serialize>(value: &T) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).expect("record-book values serialize")
-    );
+fn print_json<T: Serialize>(value: &T) -> Result<(), Error> {
+    let text = serde_json::to_string_pretty(value).expect("record-book values serialize");
+    report(&text)
 }
 
 #[cfg(test)]
@@ -211,7 +249,7 @@ mod tests {
             }),
         );
         assert_eq!(unreadable.0, 2, "the recorded count stands");
-        assert_eq!(unreadable.1, READ_BACK_FAILED);
-        assert_eq!(READ_BACK_FAILED, 3, "the code is the one the README states");
+        assert_eq!(unreadable.1, REPORT_FAILED);
+        assert_eq!(REPORT_FAILED, 3, "the code is the one the README states");
     }
 }

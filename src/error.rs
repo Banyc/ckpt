@@ -18,7 +18,9 @@ pub enum Error {
 }
 
 impl Error {
-    pub(crate) fn io(path: impl AsRef<Path>, source: io::Error) -> Error {
+    /// Report an IO failure that happened on a path, or on something named the
+    /// way a path is (a stream, for instance).
+    pub fn io(path: impl AsRef<Path>, source: io::Error) -> Error {
         Error::Io {
             path: path.as_ref().to_path_buf(),
             source,

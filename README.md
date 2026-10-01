@@ -38,7 +38,8 @@ them landed in the same instant.
 `by-flag/` is the book's one mapping: which session holds a ctf flag. Its entry
 is a session id and nothing else, so no record field is stored twice. It is
 written before the flag's own files, so a flag that can be read is always
-mapped, and every read checks the mapping against the tree: a flag the mapping
+mapped, and a reader that arrives between the two sees the mapping without its
+flag, which it reports, and every read checks the mapping against the tree: a flag the mapping
 does not give to the session being reported, a mapping whose session does not
 hold the flag, and a mapping that is not a session id are reported rather than
 followed.
@@ -54,10 +55,13 @@ one complete line in a single append, so concurrent verifications both land.
 on the total. If that read-back fails, `verify` says so on standard error, prints
 the count the append recorded instead, and exits `3` — the hit was recorded, so
 the command did not fail, but a caller can tell that the book could not be read
-back. Exit `1` means no record was left complete: a refused or failed creation
-can leave an inert remnant — a mapping entry, a directory, a log whose record
-never landed — which every read treats as absent, the same way a crash mid-write
-does.
+back. Exit `3` means the command did its work but could not report it: a hit was
+recorded and its count could not be read back or written, or a record was created
+and its id could not be written. Exit `1` means no record was left complete: a
+refused or failed creation takes its mapping entry back, and what a failure or a
+crash can still leave is a directory with no record in it, which reads treat as
+absent, or a mapping entry whose flag never landed, which is reported when that
+id is looked up.
 
 ## Commands
 

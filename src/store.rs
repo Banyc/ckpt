@@ -190,6 +190,8 @@ impl Store {
         let path = self.owner_path(flag);
         match fs::remove_file(&path) {
             Ok(()) => err,
+            // The entry is not there, which is what this was for.
+            Err(undo) if undo.kind() == io::ErrorKind::NotFound => err,
             Err(undo) => Error::io(
                 &path,
                 io::Error::new(

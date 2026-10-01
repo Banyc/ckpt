@@ -2177,3 +2177,40 @@ fn a_failed_addition_takes_its_mapping_back() {
         "and no flag is listed"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_hard_link_at_a_mapping_entry_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    let entry = dir.path().join("by-flag").join(flag.sparse_path());
+    fs::hard_link(&entry, dir.path().join("elsewhere")).expect("hard link the mapping");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "a mapping entry shared with another name is refused"
+    );
+}
+
+#[test]
+fn a_mapping_entry_may_be_written_in_sparse_form() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        dir.path().join("by-flag").join(flag.sparse_path()),
+        format!(
+            "{}/{}\n",
+            &session.as_id().as_str()[..2],
+            &session.as_id().as_str()[2..]
+        ),
+    )
+    .expect("write the mapping in the sparse form");
+
+    assert_eq!(
+        store.flag_status(&flag).expect("flag status").id,
+        flag,
+        "a sparse session id is read the way a flat one is"
+    );
+}

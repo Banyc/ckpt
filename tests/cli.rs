@@ -409,3 +409,44 @@ fn a_short_append_leaves_the_log_as_it_was() {
         "and the flag still reports its count"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn a_stdout_that_cannot_be_written_is_not_a_panic() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let flag = ok(root, &["flag", "new", session.trim(), "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+
+    // A pipe whose reader is already gone: the writes cannot be delivered.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .arg("--root")
+        .arg(root)
+        .args(["verify", &flag])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ckpt");
+    drop(child.stdout.take());
+    let code = child.wait().expect("wait").code();
+    assert_eq!(
+        code,
+        Some(3),
+        "the hit was recorded and its count could not be delivered"
+    );
+    assert!(
+        ok(root, &["status", &flag]).contains("hits    1"),
+        "and it did land"
+    );
+
+    // A read-only command has nothing to have done, so it just fails.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ckpt"))
+        .arg("--root")
+        .arg(root)
+        .args(["status", &flag])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn ckpt");
+    drop(child.stdout.take());
+    assert_eq!(child.wait().expect("wait").code(), Some(1));
+}
