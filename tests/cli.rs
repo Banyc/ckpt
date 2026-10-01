@@ -509,3 +509,24 @@ fn a_stdout_that_cannot_be_written_is_not_a_panic() {
         "and the flag it created is there"
     );
 }
+
+#[test]
+fn the_matched_flag_is_marked_in_a_report() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let session = ok(root, &["session", "new", "--desc", "s"]);
+    let session = session.trim().to_owned();
+    let flag = ok(root, &["flag", "new", &session, "--desc", "f"]);
+    let flag = flag.trim().to_owned();
+
+    let by_flag = ok(root, &["status", &flag]);
+    assert!(
+        by_flag.lines().any(|line| line.starts_with('*')),
+        "the flag the report was asked for is marked: {by_flag}"
+    );
+    let by_session = ok(root, &["status", &session]);
+    assert!(
+        !by_session.lines().any(|line| line.starts_with('*')),
+        "and nothing is marked when the session was asked for: {by_session}"
+    );
+}

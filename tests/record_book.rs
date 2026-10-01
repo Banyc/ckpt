@@ -341,8 +341,13 @@ fn sessions_are_listed_with_their_totals() {
     let first = store.session_new("first").expect("session");
     let second = store.session_new("second").expect("session");
     let first_flag = store.flag_new(&first, "a").expect("flag");
-    store.flag_new(&first, "b").expect("flag");
+    let second_flag = store.flag_new(&first, "b").expect("flag");
+    // Three hits on one flag and one on the other, so a total that is not the
+    // sum shows.
     verify_at(&store, &first_flag, 1_000);
+    verify_at(&store, &first_flag, 1_001);
+    verify_at(&store, &first_flag, 1_002);
+    verify_at(&store, &second_flag, 1_003);
 
     let sessions = store.sessions().expect("sessions");
     assert_eq!(sessions.len(), 2);
@@ -353,7 +358,7 @@ fn sessions_are_listed_with_their_totals() {
             .expect("session is listed")
     };
     assert_eq!(listed(&first).flags, 2);
-    assert_eq!(listed(&first).hits, 1);
+    assert_eq!(listed(&first).hits, 4);
     assert_eq!(listed(&second).flags, 0);
     assert_eq!(listed(&second).hits, 0);
     assert!(
@@ -2358,6 +2363,123 @@ fn a_file_at_a_canonical_name_beside_a_record_is_reported() {
     assert!(
         matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
         "a record is not read past a canonical name that is not a record"
+    );
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+fn a_listing_reports_a_session_whose_id_is_mapped() {
+    let (dir, store) = book();
+    let real = store.session_new("real").expect("session");
+    store.flag_new(&real, "flag").expect("flag");
+    let impostor = store.session_new("impostor").expect("session");
+
+    // A mapping entry for the session's own id, naming another session.
+    let entry = dir.path().join("by-flag").join(impostor.sparse_path());
+    fs::create_dir_all(entry.parent().expect("parent")).expect("create");
+    fs::write(&entry, format!("{real}\n")).expect("write the mapping");
+
+    assert!(
+        matches!(store.sessions(), Err(Error::Corrupt { .. })),
+        "a listing reports an id that names both a session and a flag"
+    );
+    assert!(matches!(
+        store.status(impostor.as_id()),
+        Err(Error::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn a_mapping_entry_with_extra_newlines_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let flag = store.flag_new(&session, "flag").expect("flag");
+    fs::write(
+        dir.path().join("by-flag").join(flag.sparse_path()),
+        format!("{session}\n\n"),
+    )
+    .expect("write two newlines after the id");
+
+    assert!(
+        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
+        "the mapping holds one id and at most the newline that ends it"
+    );
+}
+
+#[test]
+fn an_object_name_is_flat_or_the_layout_is_asked() {
+    let flat = "0123456789abcdef0123456789abcdef01234567";
+    let sparse = format!("{}/{}", &flat[..2], &flat[2..]);
+
+    assert!(
+        matches!(Id::parse(&sparse), Err(Error::InvalidId { .. })),
+        "the bare name is the flat form"
+    );
+    assert_eq!(
+        SessionId::parse(&sparse)
+            .expect("the layout reads it")
+            .as_id()
+            .as_str(),
+        flat
+    );
+}
+
+#[test]
+fn a_lookup_reports_a_foreign_name_in_the_shard_it_walks() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let shard = session_dir(dir.path(), &session)
+        .parent()
+        .expect("shard")
+        .to_path_buf();
+    fs::create_dir(shard.join("not-an-id")).expect("put a foreign name in the shard");
+
+    // An id in that shard, which is not there, and an id in a shard that is not
+    // there at all: the first reports the shard it walked, the second can only
+    // answer for its own path, and the book's damage is what a listing is for.
+    let same_shard = SessionId::parse(&format!(
+        "{}9{}",
+        &session.as_id().as_str()[..2],
+        "0".repeat(37)
+    ))
+    .expect("id");
+    if same_shard != session {
+        assert!(
+            matches!(store.status(same_shard.as_id()), Err(Error::Corrupt { .. })),
+            "the lookup reports the shard it walked"
+        );
+    }
+    let elsewhere = SessionId::generate();
+    assert!(matches!(
+        store.status(elsewhere.as_id()),
+        Err(Error::NotFound { .. })
+    ));
+    assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn a_shard_whose_name_the_filesystem_spells_differently_is_reported() {
+    let (dir, store) = book();
+    let session = store.session_new("session").expect("session");
+    let shard = session_dir(dir.path(), &session)
+        .parent()
+        .expect("shard")
+        .to_path_buf();
+    let upper = shard.with_file_name(
+        shard
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .to_uppercase(),
+    );
+    fs::rename(&shard, &upper).expect("rename the shard to a different case");
+
+    // The path only matches by case on this filesystem, and the name the
+    // filesystem has is what a lookup checks.
+    assert!(
+        matches!(store.status(session.as_id()), Err(Error::Corrupt { .. })),
+        "a shard name that is not the one on disk is reported"
     );
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
 }

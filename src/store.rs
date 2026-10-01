@@ -512,6 +512,25 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
     if !sparse::ancestors_are_real(dir)? {
         return Ok(false);
     }
+    // A shard holds only records: a name at the shard's own level that is not a
+    // shard name, and an entry beside this record that is not a record, are both
+    // reported — by a lookup of any id in that shard, and not only by a listing.
+    if let Some(shard) = dir.parent() {
+        if let Some(level) = shard.parent() {
+            for (name, path) in sparse::entries(level, sparse::Missing::Empty)? {
+                sparse::require_shard(&name, &path)?;
+            }
+        }
+        let name = shard
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_owned();
+        for (rest, entry) in sparse::entries(shard, sparse::Missing::Empty)? {
+            sparse::require_directory(&entry)?;
+            sparse::sparse_id(&name, &rest, &entry)?;
+        }
+    }
     match fs::symlink_metadata(dir) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(Error::io(dir, err)),
@@ -537,19 +556,6 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
         Ok(_) => {}
     }
 
-    // A shard holds only records: a name or an entry beside this one that is not
-    // one is reported, so a record is never read past a foreign sibling.
-    if let Some(shard) = dir.parent() {
-        let name = shard
-            .file_name()
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or_default()
-            .to_owned();
-        for (rest, entry) in sparse::entries(shard, sparse::Missing::Empty)? {
-            sparse::require_directory(&entry)?;
-            sparse::sparse_id(&name, &rest, &entry)?;
-        }
-    }
     Ok(true)
 }
 
