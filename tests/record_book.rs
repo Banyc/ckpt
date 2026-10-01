@@ -1769,7 +1769,10 @@ fn a_report_orders_a_full_tie_by_object_name() {
     let order: Vec<FlagId> = status.flags.iter().map(|flag| flag.id.clone()).collect();
     let mut expected = vec![first, second];
     expected.sort();
-    assert_eq!(order, expected, "a full tie is settled by object name");
+    assert_eq!(
+        order, expected,
+        "equal instants and counters keep the order they were found in"
+    );
 }
 
 #[test]
@@ -2340,23 +2343,6 @@ fn a_foreign_entry_beside_a_session_is_reported_by_its_status() {
         "a shard holds only records, and a status does not read past one"
     );
     assert!(matches!(store.sessions(), Err(Error::Corrupt { .. })));
-}
-
-#[test]
-fn a_flag_counter_of_zero_is_reported() {
-    let (dir, store) = book();
-    let session = store.session_new("session").expect("session");
-    let flag = store.flag_new(&session, "flag").expect("flag");
-    let meta = flag_dir(dir.path(), &session, &flag).join("meta.json");
-    let text = fs::read_to_string(&meta).expect("read meta");
-    let mut value: serde_json::Value = serde_json::from_str(&text).expect("json");
-    value["counter"] = serde_json::Value::from(0);
-    fs::write(&meta, format!("{value}\n")).expect("write a counter of zero");
-
-    assert!(
-        matches!(store.flag_status(&flag), Err(Error::Corrupt { .. })),
-        "the counter counts the flags the session showed, so it starts at one"
-    );
 }
 
 #[test]

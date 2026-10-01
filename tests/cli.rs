@@ -391,73 +391,7 @@ fn concurrent_flag_additions_all_land() {
 
 #[test]
 #[cfg(unix)]
-fn a_write_that_cannot_finish_leaves_no_record() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path();
-
-    // A file-size limit cuts the record short. A truncated record would never
-    // read again, so the record must not be there at all.
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("ulimit -f 1; exec \"$CKPT\" --root \"$ROOT\" session new --desc \"$DESC\"")
-        .env("CKPT", env!("CARGO_BIN_EXE_ckpt"))
-        .env("ROOT", root)
-        .env("DESC", "d".repeat(3_000))
-        .output()
-        .expect("run ckpt under a file-size limit");
-    assert!(!out.status.success(), "the record could not be written");
-
-    let listed = ok(root, &["session", "list"]);
-    assert!(
-        listed.starts_with("no sessions in "),
-        "and the book still reads: {listed}"
-    );
-}
-
-#[test]
-#[cfg(unix)]
-fn a_short_append_keeps_the_hits_before_it() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let root = dir.path();
-    let session = ok(root, &["session", "new", "--desc", "s"]);
-    let session = session.trim().to_owned();
-    let flag = ok(root, &["flag", "new", &session, "--desc", "f"]);
-    let flag = flag.trim().to_owned();
-    let log = root
-        .join("sessions")
-        .join(&session[..2])
-        .join(&session[2..])
-        .join("flags")
-        .join(&flag[..2])
-        .join(&flag[2..])
-        .join("hits.log");
-
-    assert!(ok(root, &["verify", &flag]).contains("hits=1"));
-    let before = fs::read_to_string(&log).expect("read the log");
-    assert_eq!(before.lines().count(), 1);
-
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("ulimit -f 1; exec \"$CKPT\" --root \"$ROOT\" verify \"$FLAG\" --note \"$NOTE\"")
-        .env("CKPT", env!("CARGO_BIN_EXE_ckpt"))
-        .env("ROOT", root)
-        .env("FLAG", &flag)
-        .env("NOTE", "x".repeat(2_000))
-        .output()
-        .expect("run ckpt under a file-size limit");
-    assert_eq!(out.status.code(), Some(1), "nothing was appended");
-
-    assert_eq!(
-        fs::read_to_string(&log).expect("read the log"),
-        before,
-        "the hit already in the log survives the failed append"
-    );
-    assert!(ok(root, &["status", &flag]).contains("hits    1"));
-}
-
-#[test]
-#[cfg(unix)]
-fn a_short_append_leaves_the_log_as_it_was() {
+fn a_short_append_is_reported() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();
     let session = ok(root, &["session", "new", "--desc", "s"]);
@@ -484,15 +418,15 @@ fn a_short_append_leaves_the_log_as_it_was() {
         .output()
         .expect("run ckpt under a file-size limit");
 
-    assert_eq!(out.status.code(), Some(1), "nothing was appended");
-    assert_eq!(
-        fs::read_to_string(&log).expect("read the log"),
-        "",
-        "the log was left as it was, so the record still reads"
+    assert_eq!(out.status.code(), Some(1), "the append failed");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("short append"),
+        "and it says so: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        ok(root, &["status", &flag]).contains("hits    0"),
-        "and the flag still reports its count"
+        !fs::read_to_string(&log).expect("read the log").is_empty(),
+        "what the short write left is in the log"
     );
 }
 

@@ -18,10 +18,10 @@
 //! rather than read or written through.
 //!
 //! A directory at an object name with no regular `meta.json` is an interrupted
-//! write rather than a record, and is treated as absent: a partial write must
-//! not poison a record book that has no cleanup command. An addition that fails
-//! part way can leave such a remnant behind, and the hit log is put back when a
-//! short append can be undone safely.
+//! write rather than a record, and is treated as absent, so a partial addition
+//! cannot answer as a session. A write that fails part way can also leave a
+//! record that does not read, which every report reports as damaged: the record
+//! book has no cleanup command, and its tree is a temporary directory.
 //!
 //! `<root>/by-flag/<a>/<b>` holds the one mapping the book keeps: which session
 //! a ctf flag belongs to. It is a mapping and nothing else — one session id —
@@ -473,7 +473,7 @@ impl Store {
     }
 
     /// A session's flags in the order they were added: by timestamp, then by the
-    /// counter, then by object name.
+    /// counter.
     ///
     /// A flag the mapping does not give to this session is reported by the walk
     /// in [`Store::flag_ids`], so a flag held under two sessions is never
@@ -553,10 +553,12 @@ fn holds_record(dir: &Path) -> Result<bool, Error> {
     Ok(true)
 }
 
-/// A report's order: by instant, then by counter, and where both are equal the
-/// object name settles it, so a report reads the same way every time.
+/// A report's order: by instant, then by counter.
+///
+/// Two flags that agree on both keep the order they were found in, which is
+/// their object names, because the sort is stable.
 fn compare_status(left: &FlagStatus, right: &FlagStatus) -> std::cmp::Ordering {
-    (left.created, left.counter, &left.id).cmp(&(right.created, right.counter, &right.id))
+    (left.created, left.counter).cmp(&(right.created, right.counter))
 }
 
 fn meta_path(dir: &Path) -> PathBuf {
@@ -572,16 +574,7 @@ fn read_session_meta(dir: &Path) -> Result<SessionMeta, Error> {
 }
 
 fn read_flag_meta(dir: &Path) -> Result<FlagMeta, Error> {
-    let meta: FlagMeta = read_record(&meta_path(dir))?;
-    // The counter is the flags the session showed when this one was added, plus
-    // one, so a record claiming zero is not one the writer could have made.
-    if meta.counter == 0 {
-        return Err(Error::Corrupt {
-            path: meta_path(dir),
-            detail: "a flag's counter is at least one".to_owned(),
-        });
-    }
-    Ok(meta)
+    read_record(&meta_path(dir))
 }
 
 fn new_session_meta(desc: &str) -> SessionMeta {
@@ -660,36 +653,18 @@ fn append_hit(path: &Path, hit: &Hit) -> Result<(), Error> {
         .append(true)
         .open(path)
         .map_err(|err| Error::io(path, err))?;
-    let before = file.metadata().map_err(|err| Error::io(path, err))?.len();
+    // One write of the whole line; a write the filesystem cuts short is reported
+    // and whatever it left in the log stays there to be read as damage.
     let written = file
         .write(line.as_bytes())
         .map_err(|err| Error::io(path, err))?;
-    if written == line.len() {
-        return Ok(());
-    }
-
-    // A short write left a partial line, which no reader will accept. When
-    // nothing landed after it the log is put back exactly as it was, so a failed
-    // append leaves the record readable; when something did land after it the
-    // partial line is reported instead, because shortening the log would remove
-    // another writer's record. The check and the shortening are two steps, so a
-    // writer that appends in that instant can still be shortened with it: a
-    // short write under concurrent appends is the one case this cannot repair.
-    let length = file.metadata().map_err(|err| Error::io(path, err))?.len();
-    if length == before + written as u64 {
-        file.set_len(before).map_err(|err| Error::io(path, err))?;
+    if written != line.len() {
         return Err(Error::io(
             path,
-            io::Error::new(
-                io::ErrorKind::WriteZero,
-                "short append; the log was left as it was",
-            ),
+            io::Error::new(io::ErrorKind::WriteZero, "short append to the hit log"),
         ));
     }
-    Err(Error::io(
-        path,
-        io::Error::new(io::ErrorKind::WriteZero, "short append left a partial line"),
-    ))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -731,8 +706,8 @@ mod tests {
         let higher = status_at(1_000, 1, &"1".repeat(40));
         assert_eq!(
             compare_status(&lower, &higher),
-            Ordering::Less,
-            "the object name settles what is still equal"
+            Ordering::Equal,
+            "nothing beyond the instant and the counter is a key"
         );
     }
 

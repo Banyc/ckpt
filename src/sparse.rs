@@ -12,7 +12,7 @@
 //! it claims to be.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
@@ -264,12 +264,7 @@ pub(crate) fn read_owned_file(path: &Path) -> Result<Option<String>, Error> {
 /// Write a file the store owns, which must not already be there.
 ///
 /// A file is written once: a name that already holds one is reported rather than
-/// overwritten, so a collision cannot destroy what landed there first — the name
-/// is checked before the content is written, and the move that follows replaces
-/// whatever is there at that instant. The
-/// content goes to a name beside it and is moved into place, so a write that
-/// fails part way leaves no record at all — a truncated record is worse than an
-/// absent one in a book that has no cleanup command.
+/// overwritten, so a collision cannot destroy what landed there first.
 pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.is_file() => {
@@ -291,41 +286,7 @@ pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
         Err(err) => return Err(Error::io(path, err)),
     }
 
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "record".to_owned());
-    let temp = path.with_file_name(format!("{name}.{}.tmp", &Id::generate().as_str()[..8]));
-    // Created exclusively: a name that is already there — including a link
-    // planted at it — is refused by the kernel rather than written through.
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-    {
-        Ok(file) => file,
-        Err(err) => return Err(left_behind(&temp, err)),
-    };
-    if let Err(err) = file.write_all(contents.as_bytes()) {
-        return Err(left_behind(&temp, err));
-    }
-    drop(file);
-    fs::rename(&temp, path).map_err(|err| left_behind(&temp, err))
-}
-
-/// The error a failed write leaves, with a name it could not clean up said out
-/// loud: the name holds nothing a read uses, but a caller may want to remove it.
-fn left_behind(temp: &Path, err: io::Error) -> Error {
-    match fs::remove_file(temp) {
-        Ok(()) => Error::io(temp, err),
-        Err(cleanup) => Error::io(
-            temp,
-            io::Error::new(
-                cleanup.kind(),
-                format!("{err}; and the temporary name could not be removed: {cleanup}"),
-            ),
-        ),
-    }
+    fs::write(path, contents).map_err(|err| Error::io(path, err))
 }
 
 #[cfg(test)]
