@@ -22,6 +22,7 @@ mod id;
 mod record;
 mod sparse;
 mod store;
+mod substrate;
 
 pub use error::Error;
 pub use id::{FlagId, Id, SessionId};

@@ -15,8 +15,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use storekit::RootedRelativePath;
+use storekit::atomic::{self, RootDir};
+
 use crate::error::Error;
 use crate::id::{HEX_LEN, Id};
+use crate::substrate;
 
 /// The number of leading characters of an object name that name a directory.
 pub(crate) const SHARD_LEN: usize = 2;
@@ -242,23 +246,57 @@ pub(crate) fn require_regular_file(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// The bytes of a regular file the store owns, read through an open root.
+///
+/// `Ok(None)` means the file is not there. A symlink, a directory, a FIFO, or
+/// a file with more than one hard link is refused with this crate's `Corrupt`,
+/// naming `path`; the bytes come from [`storekit::atomic::read_fd`], which
+/// resolves `rel` component-wise through the root descriptor, so a link
+/// planted at any component is refused rather than followed.
+pub(crate) fn read_regular_file(
+    root: &RootDir,
+    rel: &RootedRelativePath,
+    path: &Path,
+) -> Result<Option<Vec<u8>>, Error> {
+    match atomic::path_kind_fd(root, rel).map_err(|err| substrate::at(path, err))? {
+        None => Ok(None),
+        Some(_) => {
+            require_regular_file(path)?;
+            atomic::read_fd(root, rel)
+                .map(Some)
+                .map_err(|err| substrate::at(path, err))
+        }
+    }
+}
+
 /// The text of a file the store owns, with the directories above it checked.
 ///
 /// `Ok(None)` means the file is not there.
+///
+/// The entry's own directory is pinned as the read root: `ancestors_are_real`
+/// has just checked it is a real directory, and [`RootDir::open`] refuses a
+/// link in its place, so the read cannot follow one.
 pub(crate) fn read_owned_file(path: &Path) -> Result<Option<String>, Error> {
     if !ancestors_are_real(path)? {
         return Ok(None);
     }
-    match fs::symlink_metadata(path) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(Error::io(path, err)),
-        Ok(_) => {
-            require_regular_file(path)?;
-            fs::read_to_string(path)
-                .map(Some)
-                .map_err(|err| Error::io(path, err))
-        }
-    }
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Error::io(
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a store file needs a directory and a name",
+            ),
+        ));
+    };
+    let root = RootDir::open(parent).map_err(|err| substrate::at(path, err))?;
+    let rel = RootedRelativePath::parse(Path::new(name)).map_err(|err| substrate::at(path, err))?;
+    let Some(bytes) = read_regular_file(&root, &rel, path)? else {
+        return Ok(None);
+    };
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|err| Error::io(path, io::Error::new(io::ErrorKind::InvalidData, err)))
 }
 
 /// Write a file the store owns, which must not already be there.

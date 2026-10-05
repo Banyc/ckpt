@@ -6,6 +6,7 @@ description = "Record book for checkpoint flags: sessions, ctf flags, and verifi
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
+storekit = { path = "../storekit" }
 getrandom = "0.4.3"
 jiff = { version = "0.2.37", default-features = false, features = ["serde", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }

@@ -40,19 +40,24 @@
 //! in the tree, they do not defend against another process swapping one in
 //! mid-operation, because the store belongs to the process reading it.
 
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use jiff::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use storekit::RootedRelativePath;
+use storekit::atomic::RootDir;
 
 use crate::error::Error;
 use crate::id::{FlagId, Id, SessionId};
 use crate::record::{FlagMeta, FlagStatus, Hit, SessionMeta, SessionSummary, Status, Target};
 use crate::sparse::{self, Missing};
+use crate::substrate;
 
 /// Settings for [`Store::verify`].
 #[derive(Clone, Debug)]
@@ -83,6 +88,21 @@ impl Default for Verify {
 #[derive(Clone, Debug)]
 pub struct Store {
     root: PathBuf,
+    pinned: Pinned,
+}
+
+/// The store root as an open descriptor, opened on the first read that needs
+/// it (see [`Store::pinned_root`]).
+///
+/// The descriptor is shared because [`Store`] is `Clone` while [`RootDir`] is
+/// not; the manual `Debug` keeps the raw descriptor out of the derived output.
+#[derive(Clone)]
+struct Pinned(Arc<Mutex<Option<Arc<RootDir>>>>);
+
+impl fmt::Debug for Pinned {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Pinned")
+    }
 }
 
 impl Store {
@@ -96,7 +116,10 @@ impl Store {
 
     /// The store rooted at `root`.
     pub fn at(root: impl Into<PathBuf>) -> Store {
-        Store { root: root.into() }
+        Store {
+            root: root.into(),
+            pinned: Pinned(Arc::new(Mutex::new(None))),
+        }
     }
 
     /// The directory every session lives under.
@@ -132,7 +155,7 @@ impl Store {
         }
         // The session's own `meta.json` must parse: a flag is not added to a
         // record that already reads as corrupt.
-        read_session_meta(&dir)?;
+        self.read_session_meta(&dir)?;
         // And its id must not be mapped as a flag, which a listing reports too.
         self.require_not_both(&FlagId::from_id(session.as_id().clone()))?;
         // The `flags/` entry belongs to the session. A missing or foreign one
@@ -222,7 +245,7 @@ impl Store {
 
         // Read before writing: a damaged log is reported without a hit having
         // been appended.
-        let meta = read_flag_meta(&dir)?;
+        let meta = self.read_flag_meta(&dir)?;
         let hits = read_hits(&hits_path(&dir))?.len() as u64 + 1;
         let hit = Hit {
             ts: settings.at.unwrap_or_else(Timestamp::now),
@@ -271,7 +294,7 @@ impl Store {
         let mut summaries = Vec::new();
         for session in self.session_ids()? {
             let flags = self.flag_statuses(&session)?;
-            let meta = read_session_meta(&self.session_dir(&session))?;
+            let meta = self.read_session_meta(&self.session_dir(&session))?;
             summaries.push(SessionSummary {
                 session,
                 desc: meta.desc,
@@ -437,7 +460,7 @@ impl Store {
                 detail: format!("`{flag}` is mapped to a session that is not a record"),
             });
         }
-        read_session_meta(&self.session_dir(&session))?;
+        self.read_session_meta(&self.session_dir(&session))?;
         // Its flags are read the way a report reads them, and the mapping has to
         // name one of them: a mapping without its flag is reported, not passed
         // over as an absent flag.
@@ -465,7 +488,7 @@ impl Store {
 
     fn read_flag_status(&self, session: &SessionId, flag: &FlagId) -> Result<FlagStatus, Error> {
         let dir = self.flag_dir(session, flag);
-        let meta = read_flag_meta(&dir)?;
+        let meta = self.read_flag_meta(&dir)?;
         let hits = read_hits(&hits_path(&dir))?;
         Ok(FlagStatus {
             id: flag.clone(),
@@ -493,13 +516,93 @@ impl Store {
     }
 
     fn session_status(&self, session: &SessionId, matched: Target) -> Result<Status, Error> {
-        let meta = read_session_meta(&self.session_dir(session))?;
+        let meta = self.read_session_meta(&self.session_dir(session))?;
         Ok(Status {
             session: session.clone(),
             desc: meta.desc,
             created: meta.created,
             matched,
             flags: self.flag_statuses(session)?,
+        })
+    }
+
+    /// The store's root as an open descriptor, opened once and shared by every
+    /// read.
+    ///
+    /// `RootDir::open` refuses a root that is a symlink, while this crate lets
+    /// the caller choose a root that is a link: canonicalizing first resolves
+    /// the link to the directory it names, so the permission survives.
+    /// Canonicalization needs the directory to exist, and the root need not
+    /// exist until the first write creates it, so the open is deferred to the
+    /// first read that needs it: before then there is nothing under the root
+    /// to read, and the read is an absence.
+    ///
+    /// `path` is the entry being read, and names the failure if the root
+    /// cannot be opened.
+    fn pinned_root(&self, path: &Path) -> Result<Option<Arc<RootDir>>, Error> {
+        let mut pinned = self
+            .pinned
+            .0
+            .lock()
+            .expect("the root lock is never poisoned");
+        if let Some(dir) = pinned.as_ref() {
+            return Ok(Some(dir.clone()));
+        }
+        let canonical = match fs::canonicalize(&self.root) {
+            Ok(canonical) => canonical,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(Error::io(path, err)),
+        };
+        let dir = Arc::new(RootDir::open(&canonical).map_err(|err| substrate::at(path, err))?);
+        *pinned = Some(dir.clone());
+        Ok(Some(dir))
+    }
+
+    /// `path`, which must be under the store root, as the validated relative
+    /// path the substrate primitives accept.
+    fn relative(&self, path: &Path) -> Result<RootedRelativePath, Error> {
+        let rel = path.strip_prefix(&self.root).map_err(|_| Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: "a record path is not inside the store root".to_owned(),
+        })?;
+        RootedRelativePath::parse(rel).map_err(|err| substrate::at(path, err))
+    }
+
+    /// The bytes of a file the store owns, or `Ok(None)` when it is not there.
+    fn read_file(&self, path: &Path) -> Result<Option<Vec<u8>>, Error> {
+        let Some(dir) = self.pinned_root(path)? else {
+            return Ok(None);
+        };
+        let rel = self.relative(path)?;
+        sparse::read_regular_file(&dir, &rel, path)
+    }
+
+    fn read_session_meta(&self, dir: &Path) -> Result<SessionMeta, Error> {
+        self.read_record(&meta_path(dir))
+    }
+
+    fn read_flag_meta(&self, dir: &Path) -> Result<FlagMeta, Error> {
+        self.read_record(&meta_path(dir))
+    }
+
+    /// A record read through the pinned root.
+    ///
+    /// The absent branch is a mechanical failure, not a record answer: the
+    /// callers establish that the record is there (a lookup's walk, a report's
+    /// level check) and then read it, so a file that is not there vanished
+    /// between the two.
+    fn read_record<T: DeserializeOwned>(&self, path: &Path) -> Result<T, Error> {
+        let Some(bytes) = self.read_file(path)? else {
+            return Err(Error::io(
+                path,
+                io::Error::new(io::ErrorKind::NotFound, "the record file is not there"),
+            ));
+        };
+        let text = String::from_utf8(bytes)
+            .map_err(|err| Error::io(path, io::Error::new(io::ErrorKind::InvalidData, err)))?;
+        serde_json::from_str(&text).map_err(|err| Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: err.to_string(),
         })
     }
 }
@@ -581,28 +684,11 @@ fn hits_path(dir: &Path) -> PathBuf {
     dir.join("hits.log")
 }
 
-fn read_session_meta(dir: &Path) -> Result<SessionMeta, Error> {
-    read_record(&meta_path(dir))
-}
-
-fn read_flag_meta(dir: &Path) -> Result<FlagMeta, Error> {
-    read_record(&meta_path(dir))
-}
-
 fn new_session_meta(desc: &str) -> SessionMeta {
     SessionMeta {
         desc: desc.to_owned(),
         created: Timestamp::now(),
     }
-}
-
-fn read_record<T: DeserializeOwned>(path: &Path) -> Result<T, Error> {
-    sparse::require_regular_file(path)?;
-    let text = fs::read_to_string(path).map_err(|err| Error::io(path, err))?;
-    serde_json::from_str(&text).map_err(|err| Error::Corrupt {
-        path: path.to_path_buf(),
-        detail: err.to_string(),
-    })
 }
 
 fn write_record<T: Serialize>(path: &Path, value: &T) -> Result<(), Error> {
