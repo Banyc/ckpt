@@ -51,7 +51,7 @@ use jiff::Timestamp;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use storekit::RootedRelativePath;
-use storekit::atomic::RootDir;
+use storekit::atomic::{self, RootDir};
 
 use crate::error::Error;
 use crate::id::{FlagId, Id, SessionId};
@@ -211,17 +211,24 @@ impl Store {
     /// a flag.
     fn take_back_mapping(&self, flag: &FlagId, err: Error) -> Error {
         let path = self.owner_path(flag);
-        match fs::remove_file(&path) {
-            Ok(()) => err,
+        let root = match self.pinned_root(&path) {
+            Ok(Some(root)) => root,
+            // The root is not there, so this call's own entry is not there.
+            Ok(None) => return err,
+            Err(source) => return take_back_failure(&path, err, source),
+        };
+        let rel = match self.relative(&path) {
+            Ok(rel) => rel,
+            Err(source) => return take_back_failure(&path, err, source),
+        };
+        match atomic::path_kind_fd(&root, &rel) {
             // The entry is not there, which is what this was for.
-            Err(undo) if undo.kind() == io::ErrorKind::NotFound => err,
-            Err(undo) => Error::io(
-                &path,
-                io::Error::new(
-                    undo.kind(),
-                    format!("{err}; and the mapping entry could not be removed: {undo}"),
-                ),
-            ),
+            Ok(None) => err,
+            Ok(Some(_)) => match atomic::remove_file_fd(&root, &rel) {
+                Ok(()) => err,
+                Err(undo) => take_back_failure(&path, err, substrate::at(&path, undo)),
+            },
+            Err(kind) => take_back_failure(&path, err, substrate::at(&path, kind)),
         }
     }
 
@@ -678,6 +685,18 @@ fn compare_status(left: &FlagStatus, right: &FlagStatus) -> std::cmp::Ordering {
 
 fn meta_path(dir: &Path) -> PathBuf {
     dir.join("meta.json")
+}
+
+/// Report an addition's own failure together with a take-back that could not
+/// complete. The take-back failure was already mapped through the substrate
+/// boundary; its text is folded into the source so a caller sees both.
+fn take_back_failure(path: &Path, err: Error, undo: Error) -> Error {
+    Error::io(
+        path,
+        io::Error::other(format!(
+            "{err}; and the mapping entry could not be removed: {undo}"
+        )),
+    )
 }
 
 fn hits_path(dir: &Path) -> PathBuf {

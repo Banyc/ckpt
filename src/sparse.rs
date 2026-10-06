@@ -16,7 +16,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use storekit::RootedRelativePath;
-use storekit::atomic::{self, RootDir};
+use storekit::atomic::{self, PathKind, RootDir};
 
 use crate::error::Error;
 use crate::id::{HEX_LEN, Id};
@@ -63,44 +63,91 @@ pub(crate) enum Missing {
     Error,
 }
 
+/// The directory that holds `path`, with `path`'s own name as the validated
+/// relative entry, or `Ok(None)` when that directory is not there at all.
+///
+/// The parent is canonicalized before it is opened so a root the caller chose
+/// as a link stays allowed ([`RootDir::open`] refuses a symlinked root). Every
+/// level below the root is checked one level at a time before a mutation
+/// reaches it, so canonicalizing the immediate parent does not follow a link
+/// the store itself planted: a link at any owned level is refused by the call
+/// that would use that level.
+///
+/// `Ok(None)` means the parent is absent, so `path` is absent too; the caller
+/// decides whether that is an absence or a failure.
+fn open_parent(path: &Path) -> Result<Option<(RootDir, RootedRelativePath)>, Error> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(Error::io(
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a store path needs a directory and a name",
+            ),
+        ));
+    };
+    let canonical = match fs::canonicalize(parent) {
+        Ok(canonical) => canonical,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(Error::io(path, err)),
+    };
+    let root = RootDir::open(&canonical).map_err(|err| substrate::at(path, err))?;
+    let rel = RootedRelativePath::parse(Path::new(name)).map_err(|err| substrate::at(path, err))?;
+    Ok(Some((root, rel)))
+}
+
+/// The failure for a path whose directory is not there.
+fn directory_missing(path: &Path) -> Error {
+    Error::io(
+        path,
+        io::Error::new(io::ErrorKind::NotFound, "the store directory is not there"),
+    )
+}
+
 /// The non-dot entries of a directory the store owns, sorted by name.
 ///
 /// Dotfiles belong to the operating system and are skipped; every other entry
 /// must be an object name. A path that is not a real directory is a foreign
 /// entry, whether it is a file, a symlink to a directory, or a dangling
-/// symlink.
+/// symlink. The directory itself is enumerated through
+/// [`storekit::atomic::read_dir_fd`], which resolves each component relative to
+/// the opened directory and classifies every entry without following it; the
+/// shard layout and the meaning of an absence stay here.
 pub(crate) fn entries(dir: &Path, missing: Missing) -> Result<Vec<(String, PathBuf)>, Error> {
-    match fs::symlink_metadata(dir) {
-        Ok(metadata) => {
-            if !metadata.is_dir() {
-                return Err(Error::Corrupt {
-                    path: dir.to_path_buf(),
-                    detail: "a store directory must be a real directory".to_owned(),
-                });
-            }
+    let Some((root, rel)) = open_parent(dir)? else {
+        return match missing {
+            Missing::Empty => Ok(Vec::new()),
+            Missing::Error => Err(directory_missing(dir)),
+        };
+    };
+    match atomic::path_kind_fd(&root, &rel).map_err(|err| substrate::at(dir, err))? {
+        Some(PathKind::Dir) => {}
+        Some(_) => {
+            return Err(Error::Corrupt {
+                path: dir.to_path_buf(),
+                detail: "a store directory must be a real directory".to_owned(),
+            });
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            if missing == Missing::Empty {
-                return Ok(Vec::new());
-            }
+        None => {
+            return match missing {
+                Missing::Empty => Ok(Vec::new()),
+                Missing::Error => Err(directory_missing(dir)),
+            };
         }
-        Err(err) => return Err(Error::io(dir, err)),
     }
 
-    let entries = fs::read_dir(dir).map_err(|err| Error::io(dir, err))?;
+    let entries = atomic::read_dir_fd(&root, &rel).map_err(|err| substrate::at(dir, err))?;
     let mut owned = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|err| Error::io(dir, err))?;
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+        let Some(name) = entry.name.to_str().map(str::to_owned) else {
             return Err(Error::Corrupt {
-                path: entry.path(),
+                path: dir.join(&entry.name),
                 detail: "file name is not valid UTF-8".to_owned(),
             });
         };
         if name.starts_with('.') {
             continue;
         }
-        owned.push((name, entry.path()));
+        owned.push((name, dir.join(&entry.name)));
     }
     owned.sort();
     Ok(owned)
@@ -178,26 +225,54 @@ pub(crate) fn ancestors_are_real(dir: &Path) -> Result<bool, Error> {
 }
 
 /// Report a path that must be a real directory.
+///
+/// The final component is classified with [`storekit::atomic::path_kind_fd`],
+/// which does not follow it: a symlink, a file, or any other foreign entry is
+/// reported rather than used.
 pub(crate) fn require_directory(path: &Path) -> Result<(), Error> {
-    let metadata = fs::symlink_metadata(path).map_err(|err| Error::io(path, err))?;
-    if metadata.is_dir() {
-        return Ok(());
+    let Some((root, rel)) = open_parent(path)? else {
+        return Err(directory_missing(path));
+    };
+    match atomic::path_kind_fd(&root, &rel).map_err(|err| substrate::at(path, err))? {
+        Some(PathKind::Dir) => Ok(()),
+        Some(_) => Err(Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: "a store directory must be a real directory".to_owned(),
+        }),
+        None => Err(directory_missing(path)),
     }
-    Err(Error::Corrupt {
-        path: path.to_path_buf(),
-        detail: "a store directory must be a real directory".to_owned(),
-    })
 }
 
 /// Create a directory the store owns, or report a foreign entry in its place.
 ///
-/// `create_dir` does not follow a link at the final component, so an existing
-/// link fails with `AlreadyExists` and is checked rather than used.
+/// The final component is classified first, so an existing link or other
+/// foreign entry is reported rather than used; a real directory that is already
+/// there is tolerated. A missing entry is created with
+/// [`storekit::atomic::create_dir_fd`], which does not follow a link at the
+/// final component.
 pub(crate) fn ensure_directory(path: &Path) -> Result<(), Error> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => require_directory(path),
-        Err(err) => Err(Error::io(path, err)),
+    let Some((root, rel)) = open_parent(path)? else {
+        return Err(directory_missing(path));
+    };
+    match atomic::path_kind_fd(&root, &rel).map_err(|err| substrate::at(path, err))? {
+        Some(PathKind::Dir) => Ok(()),
+        Some(_) => Err(Error::Corrupt {
+            path: path.to_path_buf(),
+            detail: "a store directory must be a real directory".to_owned(),
+        }),
+        None => match atomic::create_dir_fd(&root, &rel) {
+            Ok(()) => Ok(()),
+            // A racing creation: re-classify, so a directory that appeared is
+            // tolerated and a foreign entry is still reported.
+            Err(err) => match atomic::path_kind_fd(&root, &rel) {
+                Ok(Some(PathKind::Dir)) => Ok(()),
+                Ok(Some(_)) => Err(Error::Corrupt {
+                    path: path.to_path_buf(),
+                    detail: "a store directory must be a real directory".to_owned(),
+                }),
+                _ => Err(substrate::at(path, err)),
+            },
+        },
     }
 }
 
@@ -205,19 +280,25 @@ pub(crate) fn ensure_directory(path: &Path) -> Result<(), Error> {
 ///
 /// A shard directory may be shared by many records, so it is created tolerantly;
 /// a record directory belongs to one id, and reusing the name would overwrite
-/// the record already there.
+/// the record already there. Any entry already at the name is reported as the
+/// name being taken, exactly as `create_dir`'s `AlreadyExists` was.
 pub(crate) fn create_record_dir(path: &Path) -> Result<(), Error> {
-    match fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(Error::io(
+    let Some((root, rel)) = open_parent(path)? else {
+        return Err(directory_missing(path));
+    };
+    if atomic::path_kind_fd(&root, &rel)
+        .map_err(|err| substrate::at(path, err))?
+        .is_some()
+    {
+        return Err(Error::io(
             path,
             io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "an object name already holds a record",
             ),
-        )),
-        Err(err) => Err(Error::io(path, err)),
+        ));
     }
+    atomic::create_dir_fd(&root, &rel).map_err(|err| substrate::at(path, err))
 }
 
 /// Report a file the store owns that is not a regular file of its own.
@@ -304,14 +385,16 @@ pub(crate) fn read_owned_file(path: &Path) -> Result<Option<String>, Error> {
 /// A file is written once: a name that already holds one is reported rather than
 /// overwritten, so a collision cannot destroy what landed there first.
 pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(Error::Corrupt {
-                path: path.to_path_buf(),
-                detail: "a store file must be a regular file".to_owned(),
-            });
-        }
-        Ok(_) => {
+    let Some((root, rel)) = open_parent(path)? else {
+        return Err(directory_missing(path));
+    };
+    match atomic::path_kind_fd(&root, &rel).map_err(|err| substrate::at(path, err))? {
+        // A file already holds the name. This pre-check is what makes the
+        // write-once rule hold: `write_atomic_cas_fd` treats a byte-identical
+        // rewrite as an idempotent success, which is NOT this crate's answer.
+        // The substrate's compare-and-replace is reached only for an absent
+        // name, and it still refuses a symlink at the final component.
+        Some(PathKind::File) => {
             return Err(Error::io(
                 path,
                 io::Error::new(
@@ -320,11 +403,17 @@ pub(crate) fn write_new_file(path: &Path, contents: &str) -> Result<(), Error> {
                 ),
             ));
         }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::io(path, err)),
+        Some(_) => {
+            return Err(Error::Corrupt {
+                path: path.to_path_buf(),
+                detail: "a store file must be a regular file".to_owned(),
+            });
+        }
+        None => {}
     }
 
-    fs::write(path, contents).map_err(|err| Error::io(path, err))
+    atomic::write_atomic_cas_fd(&root, &rel, contents.as_bytes())
+        .map_err(|err| substrate::at(path, err))
 }
 
 #[cfg(test)]
