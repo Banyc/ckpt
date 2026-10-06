@@ -455,6 +455,7 @@ dependencies = [
 [[package]]
 name = "storekit"
 version = "0.1.0"
+source = "git+https://github.com/Banyc/storekit?tag=v0.1.0#e3d9b9c91dfba75ac61f1e2706ac1d4af748096e"
 dependencies = [
  "getrandom",
  "hex",
